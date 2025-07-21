@@ -1,18 +1,28 @@
 # Power Predictor
 
-A tool for analyzing ECU log data to calculate power and torque curves, similar to a dynamometer.
+A tool for analyzing ECU log data to calculate power and torque curves, similar to a dynamometer. Inspired by Virtual Dyno but lacking all the testing, calibration and so on that that has undergone.
 
 ## Overview
 
 This tool analyzes CSV logs from ECUs to determine power and torque by analyzing vehicle dynamics during wide-open-throttle (WOT) conditions. It uses acceleration data, vehicle weight, gearing, and tire specifications to calculate engine power and torque.
 
+![alt text](test-unfiltered.png "Unfiltered Screenshot")
+
+## Limitations
+
+- Only works with G4X [the developer only has G4X ECUs] (but could be extended to others easily.)
+
 ## Features
 
-- Filters data for WOT conditions (99-100% throttle) with stable RPM increases
+- Filters data for WOT conditions (99-100% throttle) with stable-enough RPM increases
+- Intelligent gap bridging to handle brief throttle/RPM fluctuations
+- Configurable frame trimming to clean up start/end of power runs
 - Calculates power (HP) and torque (lb-ft) from vehicle dynamics
 - Generates dyno-style graphs showing power and torque vs RPM
+- Dataset coverage visualization showing which parts of the log were analyzed
 - Supports multiple power runs in a single log file
 - Configurable vehicle parameters (weight, gearing, tires, etc.)
+- Advanced data filtering for problematic ECU readings
 
 ## Installation
 
@@ -37,8 +47,8 @@ python power_analyzer.py "your_log.csv"
 With custom vehicle specifications:
 ```bash
 python power_analyzer.py "your_log.csv" \
-  --weight 2500 \
-  --occupant 180 \
+  --weight 1200 \
+  --occupant 100 \
   --final-drive 4.3 \
   --gear-ratio 1.000 \
   --displacement 2.0 \
@@ -49,9 +59,9 @@ python power_analyzer.py "your_log.csv" \
 ### Command Line Options
 
 #### Vehicle Specifications
-- `--weight`: Vehicle curb weight in lbs (default: 2200)
-- `--occupant`: Occupant + gear weight in lbs (default: 200)
-- `--displacement`: Engine displacement in liters (default: 2.0 )
+- `--weight`: Vehicle curb weight in kg (default: 998)
+- `--occupant`: Occupant + gear weight in kg (default: 91)
+- `--displacement`: Engine displacement in liters (default: 2.0)
 - `--cylinders`: Number of cylinders (default: 4)
 
 #### Drivetrain
@@ -68,6 +78,12 @@ python power_analyzer.py "your_log.csv" \
 - `--rolling-resistance`: Rolling resistance coefficient (default: 0.015)
 - `--drag-coefficient`: Aerodynamic drag coefficient (default: 0.3)
 - `--frontal-area`: Vehicle frontal area in m² (default: 2.5)
+
+#### Data Processing
+- `--smoothing-factor`: Data smoothing factor - 0 disables, higher values = more smoothing (default: 2.5)
+- `--trim-frames`: Number of frames to trim from start/end of each run for cleaner data (default: 20)
+- `--no-hp-torque-correction`: Disable HP-Torque relationship correction (HP = Torque * RPM / 5252)
+- `--no-rpm-filtering`: Disable RPM data filtering (keeps duplicate/bad ECU readings)
 
 #### Analysis Parameters
 - `--min-duration`: Minimum power run duration in seconds (default: 1.0)
@@ -92,10 +108,26 @@ The tool expects a CSV file with ECU log data containing these columns:
 
 ## How It Works
 
-1. **Data Filtering**: Identifies periods where throttle position ≥ 99.5% and RPM is increasing steadily
-2. **Power Calculation**: Uses vehicle dynamics (F = ma) to calculate the force required to accelerate the vehicle
-3. **Torque Calculation**: Converts wheel force back to crankshaft torque using gear ratios
-4. **Corrections**: Applies estimates for rolling resistance, aerodynamic drag, and drivetrain efficiency
+1. **Data Loading & Cleaning**: 
+   - Loads CSV data and cleans column names
+   - Filters problematic RPM readings (duplicates, reversions)
+   - Applies configurable data smoothing
+
+2. **Power Run Detection**: 
+   - Identifies periods where throttle position ≥ 99.5% and RPM is increasing steadily
+   - Bridges brief gaps (up to 3 consecutive invalid samples) to merge continuous runs
+   - Applies minimum duration and RPM range requirements
+
+3. **Frame Trimming**: 
+   - Removes configurable number of frames (default 20) from start/end of each run
+   - Cleans up potentially unstable data at run boundaries
+   - Maintains run detection but uses trimmed data for calculations
+
+4. **Power & Torque Calculation**: 
+   - Uses vehicle dynamics (F = ma) to calculate force required to accelerate the vehicle
+   - Converts wheel force back to crankshaft torque using gear ratios
+   - Applies estimates for rolling resistance, aerodynamic drag, and drivetrain efficiency
+   - Enforces HP-Torque relationship (HP = Torque × RPM ÷ 5252) for physical accuracy
 
 ## Example Output
 
@@ -103,6 +135,8 @@ The tool generates:
 - A text report with vehicle specifications and run summaries
 - Power and torque curves plotted vs RPM
 - Individual runs plus averaged curves if multiple runs are found
+- Dataset coverage visualization showing which parts of the log were used for analysis
+- Gap detection logging showing how data inconsistencies were handled
 
 ### Sample Analysis Results
 
@@ -124,8 +158,28 @@ Run 2: 6240-6775 RPM, Max 236.8 HP @ 6714 RPM, 166.7 lb-ft @ 6276 RPM
 ## Default Vehicle Specifications
 
 The tool defaults to Honda EP3 Type R specifications:
-- Weight: 2200 lbs + 200 lbs occupant
+- Weight: 998 kg + 91 kg occupant
 - Engine: 2.0L 4-cylinder
 - 4th gear ratio: 1.212:1
 - Final drive: 4.7:1
 - Tires: 195/50R15
+
+## Advanced Features
+
+### Gap Bridging
+The tool intelligently handles brief interruptions in power runs:
+- Allows up to 3 consecutive invalid samples before ending a run
+- Logs detected gaps and successful bridges
+- Prevents single data points from splitting continuous runs
+
+### Frame Trimming
+Configurable trimming of run start/end improves data quality:
+- Default: 20 frames trimmed from each end
+- Removes potentially unstable acceleration/deceleration phases
+- Coverage plot shows both detected runs (light) and trimmed data used (bold)
+
+### Data Filtering
+Advanced ECU data cleanup:
+- Removes duplicate RPM readings with different timestamps
+- Interpolates over RPM reversions during acceleration
+- Applies Gaussian smoothing with configurable intensity

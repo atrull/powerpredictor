@@ -48,10 +48,12 @@ class PowerAnalyzer:
     def __init__(self, vehicle_specs: VehicleSpecs, 
                  drivetrain_efficiency: float = 0.85,
                  rolling_resistance: float = 0.015,
-                 drag_coefficient: float = 0.3,
+                 drag_coefficient: float = 0.35,
                  frontal_area: float = 2.5,
-                 smoothing_factor: float = 1.0,
-                 apply_hp_torque_correction: bool = True):
+                 smoothing_factor: float = 2.5,
+                 apply_hp_torque_correction: bool = True,
+                 filter_rpm_data: bool = True,
+                 trim_frames: int = 20):
         self.vehicle_specs = vehicle_specs
         self.drivetrain_efficiency = drivetrain_efficiency
         self.rolling_resistance = rolling_resistance
@@ -59,6 +61,8 @@ class PowerAnalyzer:
         self.frontal_area = frontal_area
         self.smoothing_factor = smoothing_factor
         self.apply_hp_torque_correction = apply_hp_torque_correction
+        self.filter_rpm_data = filter_rpm_data
+        self.trim_frames = trim_frames
         self.data = None
         self.power_runs = []
         
@@ -81,11 +85,80 @@ class PowerAnalyzer:
             for col in numeric_columns:
                 if col in self.data.columns:
                     self.data[col] = pd.to_numeric(self.data[col], errors='coerce')
+            
+            # Filter RPM data to handle ECU reporting issues
+            if self.filter_rpm_data:
+                self._filter_rpm_data()
                     
             print(f"Loaded {len(self.data)} data points from {csv_path}")
             
         except Exception as e:
             raise ValueError(f"Error loading CSV data: {e}")
+    
+    def _filter_rpm_data(self) -> None:
+        """
+        Filter RPM data to handle ECU reporting issues like duplicate values
+        and interpolate over problematic sections
+        """
+        if 'Engine Speed' not in self.data.columns or 'Section Time' not in self.data.columns:
+            return
+        
+        rpm_col = 'Engine Speed'
+        time_col = 'Section Time'
+        
+        # Make a copy to work with
+        filtered_data = self.data.copy()
+        
+        # Find sections with duplicate or invalid RPM values
+        rpm_values = filtered_data[rpm_col].values
+        time_values = filtered_data[time_col].values
+        
+        # Identify problematic points
+        problems_found = 0
+        
+        # Method 1: Find exact duplicate RPM values that occur consecutively
+        for i in range(1, len(rpm_values)):
+            if pd.notna(rpm_values[i]) and pd.notna(rpm_values[i-1]):
+                # Check for exact duplicate RPM with different timestamps
+                if (rpm_values[i] == rpm_values[i-1] and 
+                    time_values[i] != time_values[i-1]):
+                    # Mark this point for interpolation
+                    filtered_data.loc[filtered_data.index[i], rpm_col] = np.nan
+                    problems_found += 1
+        
+        # Method 2: Find RPM reversions (significant decreases during what should be acceleration)
+        for i in range(2, len(rpm_values) - 2):
+            if (pd.notna(rpm_values[i-2]) and pd.notna(rpm_values[i-1]) and 
+                pd.notna(rpm_values[i]) and pd.notna(rpm_values[i+1]) and pd.notna(rpm_values[i+2])):
+                
+                # Check if this point is significantly out of trend
+                prev_trend = rpm_values[i-1] - rpm_values[i-2]
+                next_trend = rpm_values[i+1] - rpm_values[i]
+                
+                # If RPM drops significantly while overall trend is increasing
+                if (prev_trend > 10 and  # Previous trend was increasing
+                    rpm_values[i] < rpm_values[i-1] - 50 and  # Current point dropped significantly
+                    rpm_values[i+1] > rpm_values[i] + 10):  # Next point recovers
+                    
+                    filtered_data.loc[filtered_data.index[i], rpm_col] = np.nan
+                    problems_found += 1
+        
+        # Method 3: Interpolate over missing/filtered values
+        if problems_found > 0:
+            # Use linear interpolation based on index (which correlates with time)
+            filtered_data[rpm_col] = filtered_data[rpm_col].interpolate(
+                method='linear', 
+                limit_direction='both'
+            )
+            
+            # If any NaN values remain, use forward/backward fill
+            if filtered_data[rpm_col].isna().any():
+                filtered_data[rpm_col] = filtered_data[rpm_col].bfill().ffill()
+            
+            print(f"Filtered {problems_found} problematic RPM data points")
+        
+        # Update the main data
+        self.data = filtered_data
     
     def find_power_runs(self, min_duration: float = 1.0, min_rpm_range: float = 500, 
                        throttle_threshold: float = 99.5) -> List[Dict]:
@@ -119,37 +192,53 @@ class PowerAnalyzer:
         # Combine conditions - lower RPM threshold
         valid_conditions = wot_mask & stable_increase & (self.data['Engine Speed'] > 3000)
         
-        # Find continuous runs
+        # Find continuous runs with gap tolerance to merge close runs
         runs = []
         in_run = False
         start_idx = None
+        gap_count = 0
+        max_gap = 3  # Allow up to 3 consecutive invalid samples before ending a run
         
         for i, valid in enumerate(valid_conditions):
             if valid and not in_run:
                 start_idx = i
                 in_run = True
+                gap_count = 0
+            elif valid and in_run:
+                if gap_count > 0:
+                    # We had a gap but it's been bridged
+                    print(f"Gap bridged: {gap_count} invalid samples at index {i-gap_count}-{i-1} (RPM: {self.data.iloc[i-gap_count]['Engine Speed']:.0f}-{self.data.iloc[i-1]['Engine Speed']:.0f})")
+                gap_count = 0  # Reset gap counter when we have valid data
             elif not valid and in_run:
-                end_idx = i - 1
-                
-                # Check if run meets minimum criteria
-                duration = self.data.iloc[end_idx]['Section Time'] - self.data.iloc[start_idx]['Section Time']
-                rpm_range = self.data.iloc[end_idx]['Engine Speed'] - self.data.iloc[start_idx]['Engine Speed']
-                
-                if duration >= min_duration and rpm_range >= min_rpm_range:
-                    runs.append({
-                        'start_idx': start_idx,
-                        'end_idx': end_idx,
-                        'duration': duration,
-                        'rpm_range': rpm_range,
-                        'start_rpm': self.data.iloc[start_idx]['Engine Speed'],
-                        'end_rpm': self.data.iloc[end_idx]['Engine Speed']
-                    })
-                
-                in_run = False
+                gap_count += 1
+                if gap_count == 1:
+                    # First invalid sample in potential gap
+                    print(f"Gap detected at index {i} (RPM: {self.data.iloc[i]['Engine Speed']:.0f}, TPS: {self.data.iloc[i][tps_col]:.1f}%)")
+                if gap_count > max_gap:
+                    # End the run only after max_gap consecutive invalid samples
+                    end_idx = i - gap_count - 1
+                    print(f"Gap exceeded max_gap ({max_gap}): ending run with {gap_count} consecutive invalid samples at index {i-gap_count+1}-{i}")
+                    
+                    # Check if run meets minimum criteria
+                    duration = self.data.iloc[end_idx]['Section Time'] - self.data.iloc[start_idx]['Section Time']
+                    rpm_range = self.data.iloc[end_idx]['Engine Speed'] - self.data.iloc[start_idx]['Engine Speed']
+                    
+                    if duration >= min_duration and rpm_range >= min_rpm_range:
+                        runs.append({
+                            'start_idx': start_idx,
+                            'end_idx': end_idx,
+                            'duration': duration,
+                            'rpm_range': rpm_range,
+                            'start_rpm': self.data.iloc[start_idx]['Engine Speed'],
+                            'end_rpm': self.data.iloc[end_idx]['Engine Speed']
+                        })
+                    
+                    in_run = False
+                    gap_count = 0
         
         # Handle case where run continues to end of data
         if in_run and start_idx is not None:
-            end_idx = len(self.data) - 1
+            end_idx = len(self.data) - 1 - gap_count
             duration = self.data.iloc[end_idx]['Section Time'] - self.data.iloc[start_idx]['Section Time']
             rpm_range = self.data.iloc[end_idx]['Engine Speed'] - self.data.iloc[start_idx]['Engine Speed']
             
@@ -165,6 +254,8 @@ class PowerAnalyzer:
         
         self.power_runs = runs
         print(f"Found {len(runs)} valid power runs")
+        if self.trim_frames > 0:
+            print(f"Note: {self.trim_frames} frames will be trimmed from start/end of each run for analysis")
         return runs
     
     def calculate_power_torque(self, run_data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -296,9 +387,11 @@ class PowerAnalyzer:
         if not self.power_runs:
             raise ValueError("No power runs found. Call find_power_runs() first.")
         
-        fig, ax1 = plt.subplots(1, 1, figsize=(12, 8))
+        # Create figure with two subplots - main power plot and dataset coverage plot
+        fig, (ax1, ax_coverage) = plt.subplots(2, 1, figsize=(12, 10), 
+                                              gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.3})
         
-        # Create second y-axis for torque
+        # Create second y-axis for torque on main plot
         ax2 = ax1.twinx()
         
         colors = plt.cm.Set1(np.linspace(0, 1, len(self.power_runs)))
@@ -309,7 +402,16 @@ class PowerAnalyzer:
         
         # Plot individual runs
         for i, run in enumerate(self.power_runs):
-            run_data = self.data.iloc[run['start_idx']:run['end_idx']+1].copy()
+            # Apply frame trimming to clean up start/end values
+            start_idx = run['start_idx'] + self.trim_frames
+            end_idx = run['end_idx'] - self.trim_frames
+            
+            # Ensure we have enough data after trimming
+            if end_idx <= start_idx:
+                print(f"Warning: Run {i+1} too short after trimming {self.trim_frames} frames from each end")
+                continue
+                
+            run_data = self.data.iloc[start_idx:end_idx+1].copy()
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
             rpm = run_data['Engine Speed'].values
             
@@ -418,7 +520,39 @@ class PowerAnalyzer:
         else:
             full_info = info_text
             
-        plt.figtext(0.02, 0.02, full_info, fontsize=10, style='italic')
+        plt.figtext(0.02, -0.03, full_info, fontsize=10, style='italic')
+        
+        # Plot dataset coverage on the coverage subplot
+        if self.data is not None:
+            # Plot the entire dataset timeline as a gray line
+            total_time = self.data['Section Time'].values
+            ax_coverage.plot(total_time, [1] * len(total_time), 'lightgray', linewidth=2, alpha=0.5, label='Total Dataset')
+            
+            # Highlight power runs with colored bars
+            for i, run in enumerate(self.power_runs):
+                # Show full detected run in light color
+                full_run_data = self.data.iloc[run['start_idx']:run['end_idx']+1]
+                full_run_time = full_run_data['Section Time'].values
+                ax_coverage.plot(full_run_time, [1] * len(full_run_time), color=colors[i], linewidth=2, alpha=0.3)
+                
+                # Show trimmed run (actually used for analysis) in bold color
+                start_idx = run['start_idx'] + self.trim_frames
+                end_idx = run['end_idx'] - self.trim_frames
+                if end_idx > start_idx:
+                    trimmed_run_data = self.data.iloc[start_idx:end_idx+1]
+                    trimmed_run_time = trimmed_run_data['Section Time'].values
+                    ax_coverage.plot(trimmed_run_time, [1] * len(trimmed_run_time), color=colors[i], linewidth=4, alpha=0.8, label=f'Run {i+1} (trimmed)')
+            
+            # Format coverage plot
+            ax_coverage.set_xlabel('Time (seconds)', fontsize=10)
+            ax_coverage.set_ylabel('Runs', fontsize=10)
+            ax_coverage.set_ylim(0.5, 1.5)
+            ax_coverage.set_title('Dataset Coverage - Power Run Locations', fontsize=11)
+            ax_coverage.grid(True, alpha=0.3)
+            ax_coverage.legend(loc='upper right', fontsize=9)
+            
+            # Remove y-tick labels since they're not meaningful
+            ax_coverage.set_yticks([])
         
         plt.tight_layout()
         
@@ -453,7 +587,15 @@ class PowerAnalyzer:
         ])
         
         for i, run in enumerate(self.power_runs):
-            run_data = self.data.iloc[run['start_idx']:run['end_idx']+1]
+            # Apply frame trimming to clean up start/end values
+            start_idx = run['start_idx'] + self.trim_frames
+            end_idx = run['end_idx'] - self.trim_frames
+            
+            # Ensure we have enough data after trimming
+            if end_idx <= start_idx:
+                continue
+                
+            run_data = self.data.iloc[start_idx:end_idx+1]
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
             
             valid_mask = (power_hp > 0) & (power_hp < 1000) & (torque_lbft > 0) & (torque_lbft < 1000)
@@ -543,14 +685,18 @@ Examples:
                        help='Drivetrain efficiency factor (default: 0.85)')
     parser.add_argument('--rolling-resistance', type=float, default=0.015, 
                        help='Rolling resistance coefficient (default: 0.015)')
-    parser.add_argument('--drag-coefficient', type=float, default=0.3, 
-                       help='Aerodynamic drag coefficient (default: 0.3)')
+    parser.add_argument('--drag-coefficient', type=float, default=0.35, 
+                       help='Aerodynamic drag coefficient (default: 0.35)')
     parser.add_argument('--frontal-area', type=float, default=2.5, 
                        help='Vehicle frontal area in m² (default: 2.5)')
-    parser.add_argument('--smoothing-factor', type=float, default=1.0, 
-                       help='Data smoothing factor - 0 disables, higher values = more smoothing (default: 1.0)')
+    parser.add_argument('--smoothing-factor', type=float, default=2.5, 
+                       help='Data smoothing factor - 0 disables, higher values = more smoothing (default: 2.5)')
     parser.add_argument('--no-hp-torque-correction', action='store_true', 
                        help='Disable HP-Torque relationship correction (HP = Torque * RPM / 5252)')
+    parser.add_argument('--no-rpm-filtering', action='store_true', 
+                       help='Disable RPM data filtering (keeps duplicate/bad ECU readings)')
+    parser.add_argument('--trim-frames', type=int, default=20, 
+                       help='Number of frames to trim from start/end of each run for cleaner data (default: 20)')
     
     # Analysis parameters
     parser.add_argument('--min-duration', type=float, default=1.0, 
@@ -589,7 +735,9 @@ Examples:
             drag_coefficient=args.drag_coefficient,
             frontal_area=args.frontal_area,
             smoothing_factor=args.smoothing_factor,
-            apply_hp_torque_correction=not args.no_hp_torque_correction
+            apply_hp_torque_correction=not args.no_hp_torque_correction,
+            filter_rpm_data=not args.no_rpm_filtering,
+            trim_frames=args.trim_frames
         )
         
         analyzer.load_data(args.csv_file)
