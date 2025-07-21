@@ -161,7 +161,7 @@ class PowerAnalyzer:
         self.data = filtered_data
     
     def find_power_runs(self, min_duration: float = 1.0, min_rpm_range: float = 500, 
-                       throttle_threshold: float = 99.5) -> List[Dict]:
+                       throttle_threshold: float = 96) -> List[Dict]:
         """
         Find periods where throttle is at WOT and RPM increases steadily
         
@@ -703,8 +703,8 @@ Examples:
                        help='Minimum power run duration in seconds (default: 1.0)')
     parser.add_argument('--min-rpm-range', type=float, default=500, 
                        help='Minimum RPM range for valid run (default: 500)')
-    parser.add_argument('--throttle-threshold', type=float, default=99.5, 
-                       help='Minimum throttle %% for WOT detection (default: 99.5)')
+    parser.add_argument('--throttle-threshold', type=float, default=96, 
+                       help='Minimum throttle %% for WOT detection (default: 96)')
     
     # Output options
     parser.add_argument('--output', help='Output file for plot (optional)')
