@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import warnings
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import savgol_filter
 warnings.filterwarnings('ignore')
 
 @dataclass
@@ -53,7 +54,8 @@ class PowerAnalyzer:
                  smoothing_factor: float = 2.5,
                  apply_hp_torque_correction: bool = True,
                  filter_rpm_data: bool = True,
-                 trim_frames: int = 20):
+                 trim_frames: int = 20,
+                 max_gap: int = 5):
         self.vehicle_specs = vehicle_specs
         self.drivetrain_efficiency = drivetrain_efficiency
         self.rolling_resistance = rolling_resistance
@@ -63,6 +65,7 @@ class PowerAnalyzer:
         self.apply_hp_torque_correction = apply_hp_torque_correction
         self.filter_rpm_data = filter_rpm_data
         self.trim_frames = trim_frames
+        self.max_gap = max_gap
         self.data = None
         self.power_runs = []
         
@@ -97,70 +100,141 @@ class PowerAnalyzer:
     
     def _filter_rpm_data(self) -> None:
         """
-        Filter RPM data to handle ECU reporting issues like duplicate values
-        and interpolate over problematic sections
+        Enhanced RPM data filtering for ECUs with poor synchronization
+        Uses multi-stage approach: outlier detection, trend analysis, and adaptive smoothing
         """
         if 'Engine Speed' not in self.data.columns or 'Section Time' not in self.data.columns:
             return
         
         rpm_col = 'Engine Speed'
         time_col = 'Section Time'
+        tps_col = 'TPS (Main)' if 'TPS (Main)' in self.data.columns else 'TPS 2(Main)'
         
         # Make a copy to work with
         filtered_data = self.data.copy()
         
-        # Find sections with duplicate or invalid RPM values
-        rpm_values = filtered_data[rpm_col].values
+        rpm_values = filtered_data[rpm_col].values.copy().astype(float)  # Convert to float to allow NaN
         time_values = filtered_data[time_col].values
+        tps_values = filtered_data[tps_col].values if tps_col in filtered_data.columns else np.full(len(rpm_values), 0)
         
-        # Identify problematic points
+        # Calculate time deltas for physical constraint checking
+        time_deltas = np.diff(time_values)
+        
         problems_found = 0
+        outliers_found = 0
         
-        # Method 1: Find exact duplicate RPM values that occur consecutively
+        # Stage 1: Remove exact duplicates
         for i in range(1, len(rpm_values)):
             if pd.notna(rpm_values[i]) and pd.notna(rpm_values[i-1]):
-                # Check for exact duplicate RPM with different timestamps
                 if (rpm_values[i] == rpm_values[i-1] and 
                     time_values[i] != time_values[i-1]):
-                    # Mark this point for interpolation
-                    filtered_data.loc[filtered_data.index[i], rpm_col] = np.nan
+                    rpm_values[i] = np.nan
                     problems_found += 1
         
-        # Method 2: Find RPM reversions (significant decreases during what should be acceleration)
-        for i in range(2, len(rpm_values) - 2):
-            if (pd.notna(rpm_values[i-2]) and pd.notna(rpm_values[i-1]) and 
-                pd.notna(rpm_values[i]) and pd.notna(rpm_values[i+1]) and pd.notna(rpm_values[i+2])):
-                
-                # Check if this point is significantly out of trend
-                prev_trend = rpm_values[i-1] - rpm_values[i-2]
-                next_trend = rpm_values[i+1] - rpm_values[i]
-                
-                # If RPM drops significantly while overall trend is increasing
-                if (prev_trend > 10 and  # Previous trend was increasing
-                    rpm_values[i] < rpm_values[i-1] - 50 and  # Current point dropped significantly
-                    rpm_values[i+1] > rpm_values[i] + 10):  # Next point recovers
-                    
-                    filtered_data.loc[filtered_data.index[i], rpm_col] = np.nan
-                    problems_found += 1
+        # Stage 2: Enhanced outlier detection using physical constraints
+        max_rpm_per_sec = 1500  # Maximum realistic RPM/sec acceleration at WOT
         
-        # Method 3: Interpolate over missing/filtered values
-        if problems_found > 0:
-            # Use linear interpolation based on index (which correlates with time)
-            filtered_data[rpm_col] = filtered_data[rpm_col].interpolate(
-                method='linear', 
-                limit_direction='both'
+        for i in range(1, len(rpm_values) - 1):
+            if pd.notna(rpm_values[i-1]) and pd.notna(rpm_values[i]) and pd.notna(rpm_values[i+1]):
+                dt_prev = time_deltas[i-1] if i-1 < len(time_deltas) else 0.02
+                dt_next = time_deltas[i] if i < len(time_deltas) else 0.02
+                
+                # Calculate acceleration rates
+                accel_in = (rpm_values[i] - rpm_values[i-1]) / dt_prev if dt_prev > 0 else 0
+                accel_out = (rpm_values[i+1] - rpm_values[i]) / dt_next if dt_next > 0 else 0
+                
+                # Check for physically impossible accelerations or direction reversals
+                is_outlier = False
+                
+                # High TPS with impossible RPM drops
+                if tps_values[i] > 95 and accel_in < -500:
+                    is_outlier = True
+                
+                # Sudden direction changes that exceed physical limits
+                if abs(accel_in) > max_rpm_per_sec or abs(accel_out) > max_rpm_per_sec:
+                    # Check if this is a genuine outlier vs normal acceleration
+                    if abs(accel_in - accel_out) > max_rpm_per_sec:
+                        is_outlier = True
+                
+                # RPM value significantly out of local trend
+                if i >= 2 and i < len(rpm_values) - 2:
+                    local_trend = np.median([rpm_values[i-2], rpm_values[i-1], rpm_values[i+1], rpm_values[i+2]])
+                    if abs(rpm_values[i] - local_trend) > 100:  # More than 100 RPM from local median
+                        is_outlier = True
+                
+                if is_outlier:
+                    rpm_values[i] = np.nan
+                    outliers_found += 1
+        
+        # Stage 3: Multi-pass trend-based smoothing for WOT sections
+        wot_mask = tps_values > 95  # Wide open throttle detection
+        
+        # Apply Savitzky-Golay filter to WOT sections for better trend preservation
+        
+        # Find continuous WOT sections
+        wot_sections = []
+        in_wot = False
+        start_idx = None
+        
+        for i, is_wot in enumerate(wot_mask):
+            if is_wot and not in_wot:
+                start_idx = i
+                in_wot = True
+            elif not is_wot and in_wot:
+                if start_idx is not None and i - start_idx > 10:  # At least 10 samples
+                    wot_sections.append((start_idx, i))
+                in_wot = False
+                start_idx = None
+        
+        # Handle case where WOT continues to end
+        if in_wot and start_idx is not None:
+            wot_sections.append((start_idx, len(wot_mask)))
+        
+        # Apply enhanced smoothing to each WOT section
+        for start, end in wot_sections:
+            section_rpm = rpm_values[start:end].copy()
+            section_time = time_values[start:end]
+            
+            # First, interpolate any remaining NaN values in this section
+            section_mask = ~np.isnan(section_rpm)
+            if np.sum(section_mask) > 5:  # Need at least 5 valid points
+                # Linear interpolation for gaps
+                section_rpm = np.interp(
+                    section_time,
+                    section_time[section_mask],
+                    section_rpm[section_mask]
+                )
+                
+                # Apply smoothing filter if section is long enough
+                if len(section_rpm) >= 10:
+                    # Use moving average for now to avoid savgol complexity
+                    window = min(7, len(section_rpm) // 3)
+                    if window >= 3:
+                        section_rpm = pd.Series(section_rpm).rolling(window=window, center=True).mean().bfill().ffill().values
+                
+                # Update the main array
+                rpm_values[start:end] = section_rpm
+        
+        # Stage 4: Final interpolation for any remaining NaN values
+        rpm_mask = ~np.isnan(rpm_values)
+        if np.sum(rpm_mask) > 0:
+            rpm_values = np.interp(
+                time_values,
+                time_values[rpm_mask],
+                rpm_values[rpm_mask]
             )
-            
-            # If any NaN values remain, use forward/backward fill
-            if filtered_data[rpm_col].isna().any():
-                filtered_data[rpm_col] = filtered_data[rpm_col].bfill().ffill()
-            
-            print(f"Filtered {problems_found} problematic RPM data points")
+        
+        # Update the filtered data
+        filtered_data[rpm_col] = rpm_values
+        
+        total_issues = problems_found + outliers_found
+        if total_issues > 0:
+            print(f"Enhanced RPM filtering: {problems_found} duplicates, {outliers_found} outliers, {len(wot_sections)} WOT sections smoothed")
         
         # Update the main data
         self.data = filtered_data
     
-    def find_power_runs(self, min_duration: float = 1.0, min_rpm_range: float = 500, 
+    def find_power_runs(self, min_duration: float = 1.0, min_rpm_range: float = 2500, 
                        throttle_threshold: float = 96) -> List[Dict]:
         """
         Find periods where throttle is at WOT and RPM increases steadily
@@ -190,14 +264,14 @@ class PowerAnalyzer:
         stable_increase = rpm_diff > 5  # RPM increasing at least 5/sample (more lenient)
         
         # Combine conditions - lower RPM threshold
-        valid_conditions = wot_mask & stable_increase & (self.data['Engine Speed'] > 3000)
+        valid_conditions = wot_mask & stable_increase & (self.data['Engine Speed'] > 2000)
         
         # Find continuous runs with gap tolerance to merge close runs
         runs = []
         in_run = False
         start_idx = None
         gap_count = 0
-        max_gap = 3  # Allow up to 3 consecutive invalid samples before ending a run
+        max_gap = self.max_gap  # Allow configurable consecutive invalid samples before ending a run
         
         for i, valid in enumerate(valid_conditions):
             if valid and not in_run:
@@ -522,6 +596,55 @@ class PowerAnalyzer:
             
         plt.figtext(0.02, -0.03, full_info, fontsize=10, style='italic')
         
+        # Add environmental conditions (BAP and IAT) to bottom right
+        env_conditions = []
+        if self.power_runs:
+            # Collect environmental data from all power runs
+            all_bap = []
+            all_iat = []
+            
+            for run in self.power_runs:
+                start_idx = run['start_idx'] + self.trim_frames
+                end_idx = run['end_idx'] - self.trim_frames
+                
+                if end_idx > start_idx:
+                    run_data = self.data.iloc[start_idx:end_idx+1]
+                    
+                    # Collect BAP values
+                    if 'BAP' in run_data.columns:
+                        bap_values = run_data['BAP'].dropna()
+                        if len(bap_values) > 0:
+                            all_bap.extend(bap_values.tolist())
+                    
+                    # Collect IAT values
+                    if 'IAT' in run_data.columns:
+                        iat_values = run_data['IAT'].dropna()
+                        if len(iat_values) > 0:
+                            all_iat.extend(iat_values.tolist())
+            
+            # Format environmental conditions
+            if all_bap:
+                if len(set([round(x, 1) for x in all_bap])) == 1:
+                    # All values are the same (within 0.1 kPa)
+                    env_conditions.append(f"BAP: {np.mean(all_bap):.1f} kPa")
+                else:
+                    # Show range
+                    env_conditions.append(f"BAP: {min(all_bap):.1f} - {max(all_bap):.1f} kPa")
+            
+            if all_iat:
+                if len(set([round(x) for x in all_iat])) == 1:
+                    # All values are the same (within 1°C)
+                    env_conditions.append(f"IAT: {np.mean(all_iat):.0f}°C")
+                else:
+                    # Show range
+                    env_conditions.append(f"IAT: {min(all_iat):.0f} - {max(all_iat):.0f}°C")
+        
+        # Add environmental conditions text to bottom right if we have any
+        if env_conditions:
+            env_text = "\n".join(env_conditions)
+            plt.figtext(0.98, -0.03, env_text, fontsize=10, style='italic', 
+                       ha='right', va='bottom')
+        
         # Plot dataset coverage on the coverage subplot
         if self.data is not None:
             # Plot the entire dataset timeline as a gray line
@@ -626,6 +749,24 @@ class PowerAnalyzer:
                 else:
                     report.append(f"  HP=Torque Crossover: Not in RPM range (5252 RPM outside {run['start_rpm']:.0f}-{run['end_rpm']:.0f})")
                 
+                # Add environmental conditions for this run
+                start_bap = run_data['BAP'].iloc[0] if 'BAP' in run_data.columns else None
+                end_bap = run_data['BAP'].iloc[-1] if 'BAP' in run_data.columns else None
+                start_iat = run_data['IAT'].iloc[0] if 'IAT' in run_data.columns else None
+                end_iat = run_data['IAT'].iloc[-1] if 'IAT' in run_data.columns else None
+                
+                if start_bap is not None:
+                    if end_bap is not None and abs(end_bap - start_bap) > 0.1:
+                        report.append(f"  Barometric Pressure: {start_bap:.1f} - {end_bap:.1f} kPa")
+                    else:
+                        report.append(f"  Barometric Pressure: {start_bap:.1f} kPa")
+                
+                if start_iat is not None:
+                    if end_iat is not None and abs(end_iat - start_iat) > 1:
+                        report.append(f"  Intake Air Temperature: {start_iat:.0f} - {end_iat:.0f}°C")
+                    else:
+                        report.append(f"  Intake Air Temperature: {start_iat:.0f}°C")
+                
                 report.append("")
         
         return "\n".join(report)
@@ -697,17 +838,19 @@ Examples:
                        help='Disable RPM data filtering (keeps duplicate/bad ECU readings)')
     parser.add_argument('--trim-frames', type=int, default=20, 
                        help='Number of frames to trim from start/end of each run for cleaner data (default: 20)')
+    parser.add_argument('--max-gap', type=int, default=5, 
+                       help='Maximum consecutive invalid samples allowed before ending a power run (default: 5)')
     
     # Analysis parameters
     parser.add_argument('--min-duration', type=float, default=1.0, 
                        help='Minimum power run duration in seconds (default: 1.0)')
-    parser.add_argument('--min-rpm-range', type=float, default=500, 
-                       help='Minimum RPM range for valid run (default: 500)')
+    parser.add_argument('--min-rpm-range', type=float, default=2500, 
+                       help='Minimum RPM range for valid run (default: 2500)')
     parser.add_argument('--throttle-threshold', type=float, default=96, 
                        help='Minimum throttle %% for WOT detection (default: 96)')
     
     # Output options
-    parser.add_argument('--output', help='Output file for plot (optional)')
+    parser.add_argument('--out', help='Output file for plot (optional)')
     parser.add_argument('--title', help='Custom title for the plot')
     parser.add_argument('--no-plot', action='store_true', help='Skip generating plot')
     
@@ -737,7 +880,8 @@ Examples:
             smoothing_factor=args.smoothing_factor,
             apply_hp_torque_correction=not args.no_hp_torque_correction,
             filter_rpm_data=not args.no_rpm_filtering,
-            trim_frames=args.trim_frames
+            trim_frames=args.trim_frames,
+            max_gap=args.max_gap
         )
         
         analyzer.load_data(args.csv_file)
@@ -750,7 +894,7 @@ Examples:
         if analyzer.power_runs:
             print(analyzer.generate_report())
             if not args.no_plot:
-                analyzer.plot_power_curves(args.output, args.title)
+                analyzer.plot_power_curves(args.out, args.title)
         else:
             print("No valid power runs found in the data.")
             print(f"Try adjusting --throttle-threshold (currently {args.throttle_threshold}%)")
@@ -764,3 +908,80 @@ Examples:
 
 if __name__ == "__main__":
     exit(main())
+
+"""
+=============================================================================
+CSV FILE REQUIREMENTS FOR POWER_PREDICTOR.PY
+=============================================================================
+
+REQUIRED COLUMNS (Script will not work without these):
+--------------------------------------------------------
+1. 'Section Time' - Time stamps for each data point (seconds)
+   - Must be continuously increasing values
+   - Used for calculating acceleration and power runs duration
+   
+2. 'Engine Speed' - Engine RPM values
+   - Must be numeric values > 0
+   - Used for all power/torque calculations and run detection
+   
+3. 'TPS (Main)' OR 'TPS 2(Main)' - Throttle Position Sensor percentage
+   - Must be numeric values 0-100
+   - Used to detect Wide Open Throttle (WOT) conditions
+   - Script looks for 'TPS (Main)' first, falls back to 'TPS 2(Main)'
+
+CSV FORMAT REQUIREMENTS:
+------------------------
+- Header must be in row 2 (0-indexed row 1)
+- Row 3 should contain units (will be skipped)
+- Data starts from row 4
+- Column names will be cleaned (quotes and whitespace removed)
+- File format: CSV with standard comma separation
+
+NICE-TO-HAVE COLUMNS (Enhance analysis but not required):
+---------------------------------------------------------
+4. 'Driven Wheel Speed' - Wheel speed data
+   - Provides additional validation for calculations
+   
+5. 'Acceleration' - Direct acceleration measurements
+   - Can supplement calculated acceleration values
+   
+6. 'MAP' - Manifold Absolute Pressure
+   - Useful for engine load analysis
+   
+7. 'BAP' - Barometric Pressure (kPa)
+   - Used for environmental condition reporting
+   - Shows atmospheric pressure during runs
+   
+8. 'IAT' - Intake Air Temperature (°C)
+   - Used for environmental condition reporting
+   - Important for density altitude corrections
+   
+9. 'Lambda 1' OR 'Lambda Avg' - Air/Fuel ratio data
+   - Can be displayed on graphs for tuning analysis
+   - Shows if engine is running rich/lean during power runs
+
+POWER RUN DETECTION CRITERIA:
+-----------------------------
+The script automatically detects power runs based on:
+- Throttle position >= threshold (default 96%, configurable)
+- Engine RPM steadily increasing (> 5 RPM per sample)
+- Engine RPM > 2000 (configurable)
+- Minimum duration of 2.0 seconds (configurable)
+- Minimum RPM range of 2500 RPM (configurable)
+
+EXAMPLE CSV STRUCTURE:
+----------------------
+Line 1: [File info/metadata - ignored]
+Line 2: "Section Time","Engine Speed","TPS (Main)","BAP","IAT",...
+Line 3: "s","RPM","%","kPa","°C",...
+Line 4: 0.000,32500,99.2,101.3,25,...
+Line 5: 0.010,3515,99.5,101.3,25,...
+...
+
+TROUBLESHOOTING:
+----------------
+- If no power runs found, try lowering --throttle-threshold
+- If runs are too short, adjust --min-duration or --min-rpm-range
+- If RPM data looks erratic, keep --filter-rpm-data enabled (default)
+- Use --trim-frames to clean up start/end of detected runs
+"""
