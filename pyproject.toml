@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
+    "cx-freeze>=8.3.0",
     "matplotlib>=3.10.3",
+    "nuitka>=2.7.12",
     "numpy>=2.3.1",
     "pandas>=2.3.1",
     "scipy>=1.16.0",

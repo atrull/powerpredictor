@@ -4,17 +4,28 @@ Power and Torque Analysis Tool for ECU Log Data
 Analyzes CSV logs to calculate power and torque curves like a dynamometer
 """
 
-import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional
 import argparse
 from dataclasses import dataclass
 import warnings
-from scipy import signal
-from scipy.ndimage import gaussian_filter1d
-from scipy.signal import savgol_filter
+import sys
 warnings.filterwarnings('ignore')
+
+# Lazy imports for heavy dependencies
+def _import_pandas():
+    import pandas as pd
+    return pd
+
+def _import_matplotlib():
+    import matplotlib.pyplot as plt
+    return plt
+
+def _import_scipy():
+    from scipy import signal
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.signal import savgol_filter
+    return signal, gaussian_filter1d, savgol_filter
 
 @dataclass
 class VehicleSpecs:
@@ -73,6 +84,7 @@ class PowerAnalyzer:
         """Load CSV data and clean column names"""
         try:
             # Read CSV - header is in row 2 (0-indexed row 1), data starts from row 4
+            pd = _import_pandas()
             self.data = pd.read_csv(csv_path, header=1, skiprows=[2])  # Skip units row
             
             # Clean column names
@@ -105,6 +117,8 @@ class PowerAnalyzer:
         """
         if 'Engine Speed' not in self.data.columns or 'Section Time' not in self.data.columns:
             return
+        
+        pd = _import_pandas()
         
         rpm_col = 'Engine Speed'
         time_col = 'Section Time'
@@ -332,7 +346,8 @@ class PowerAnalyzer:
             print(f"Note: {self.trim_frames} frames will be trimmed from start/end of each run for analysis")
         return runs
     
-    def calculate_power_torque(self, run_data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    def calculate_power_torque(self, run_data) -> Tuple[np.ndarray, np.ndarray]:
+        signal, gaussian_filter1d, savgol_filter = _import_scipy()
         """
         Calculate power and torque from vehicle dynamics using RPM rate of change
         
@@ -409,7 +424,7 @@ class PowerAnalyzer:
         
         return corrected_power_hp, torque_lbft
     
-    def validate_hp_torque_crossover(self, run_data: pd.DataFrame, power_hp: np.ndarray, torque_lbft: np.ndarray) -> Dict[str, float]:
+    def validate_hp_torque_crossover(self, run_data, power_hp: np.ndarray, torque_lbft: np.ndarray) -> Dict[str, float]:
         """
         Validate that HP and Torque curves cross at 5252 RPM
         
@@ -462,6 +477,8 @@ class PowerAnalyzer:
             raise ValueError("No power runs found. Call find_power_runs() first.")
         
         # Create figure with two subplots - main power plot and dataset coverage plot
+        plt = _import_matplotlib()
+        signal, gaussian_filter1d, savgol_filter = _import_scipy()
         fig, (ax1, ax_coverage) = plt.subplots(2, 1, figsize=(12, 10), 
                                               gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.3})
         
@@ -907,7 +924,7 @@ Examples:
     return 0
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
 
 """
 =============================================================================
