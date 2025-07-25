@@ -24,9 +24,11 @@ k20-unfiltered:
 
 white:
 	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_nbg_run.png
+	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_pull2.png
 
 white-unfiltered:
-	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --no-rpm-filtering --out white_nbg_run-unfiltered.png
+	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_nbg_run-unfiltered.png --no-rpm-filtering 
+	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_pull2.png --no-rpm-filtering 
 
 black:
 	# should be 4th gear 1.0 ratio but that predicts too much power
