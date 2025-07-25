@@ -66,7 +66,8 @@ class PowerAnalyzer:
                  apply_hp_torque_correction: bool = True,
                  filter_rpm_data: bool = True,
                  trim_frames: int = 20,
-                 max_gap: int = 5):
+                 max_gap: int = 5,
+                 downsample_hz: float = None):
         self.vehicle_specs = vehicle_specs
         self.drivetrain_efficiency = drivetrain_efficiency
         self.rolling_resistance = rolling_resistance
@@ -77,6 +78,7 @@ class PowerAnalyzer:
         self.filter_rpm_data = filter_rpm_data
         self.trim_frames = trim_frames
         self.max_gap = max_gap
+        self.downsample_hz = downsample_hz
         self.data = None
         self.power_runs = []
         
@@ -104,6 +106,12 @@ class PowerAnalyzer:
             # Filter RPM data to handle ECU reporting issues
             if self.filter_rpm_data:
                 self._filter_rpm_data()
+            
+            # Apply downsampling if requested
+            if self.downsample_hz is not None:
+                original_count = len(self.data)
+                self.data = self._downsample_data(self.downsample_hz)
+                print(f"Downsampled from {original_count} to {len(self.data)} data points at {self.downsample_hz}Hz")
                     
             print(f"Loaded {len(self.data)} data points from {csv_path}")
             
@@ -300,6 +308,58 @@ class PowerAnalyzer:
         
         return corrected_rpm
     
+    def _downsample_data(self, target_hz: float):
+        """
+        Downsample data to target frequency using uniform time intervals
+        
+        Args:
+            target_hz: Target sampling frequency in Hz
+            
+        Returns:
+            Downsampled DataFrame
+        """
+        pd = _import_pandas()
+        
+        if 'Section Time' not in self.data.columns:
+            raise ValueError("Section Time column required for downsampling")
+        
+        # Calculate target time step
+        target_dt = 1.0 / target_hz
+        
+        # Get time range
+        time_col = self.data['Section Time']
+        start_time = time_col.min()
+        end_time = time_col.max()
+        
+        # Create uniform time grid
+        uniform_times = np.arange(start_time, end_time + target_dt, target_dt)
+        
+        # Interpolate all numeric columns to uniform time grid
+        downsampled_data = pd.DataFrame({'Section Time': uniform_times})
+        
+        for col in self.data.columns:
+            if col != 'Section Time' and pd.api.types.is_numeric_dtype(self.data[col]):
+                # Remove NaN values for interpolation
+                valid_mask = ~pd.isna(self.data[col])
+                if valid_mask.sum() > 1:  # Need at least 2 points to interpolate
+                    downsampled_data[col] = np.interp(
+                        uniform_times,
+                        time_col[valid_mask],
+                        self.data[col][valid_mask]
+                    )
+                else:
+                    # If not enough valid data, fill with the first valid value
+                    first_valid = self.data[col][valid_mask].iloc[0] if valid_mask.sum() > 0 else 0
+                    downsampled_data[col] = first_valid
+            elif col != 'Section Time':
+                # For non-numeric columns, forward fill from nearest time
+                downsampled_data[col] = self.data[col].iloc[0]  # Simple approach
+        
+        print(f"Downsampled from {len(self.data)} to {len(downsampled_data)} points "
+              f"({1/np.mean(np.diff(time_col)):.1f}Hz -> {target_hz}Hz)")
+        
+        return downsampled_data
+    
     def _apply_dyno_style_smoothing(self, power_hp: np.ndarray, torque_lbft: np.ndarray, rpm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Apply dyno-style smoothing that balances noise reduction with curve characteristics
@@ -382,7 +442,7 @@ class PowerAnalyzer:
         
         # Calculate RPM rate of change (less aggressive filtering)
         rpm_diff = self.data['Engine Speed'].diff().rolling(window=3, center=True).mean()
-        stable_increase = rpm_diff > 5  # RPM increasing at least 5/sample (more lenient)
+        stable_increase = rpm_diff > -10  # Allow small RPM decreases for downsampled data
         
         # Combine conditions - lower RPM threshold
         valid_conditions = wot_mask & stable_increase & (self.data['Engine Speed'] > 2000)
@@ -453,13 +513,14 @@ class PowerAnalyzer:
             print(f"Note: {self.trim_frames} frames will be trimmed from start/end of each run for analysis")
         return runs
     
-    def calculate_power_torque(self, run_data) -> Tuple[np.ndarray, np.ndarray]:
+    def calculate_power_torque(self, run_data, debug_mode: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         signal, gaussian_filter1d, savgol_filter = _import_scipy()
         """
         Calculate power and torque from vehicle dynamics using RPM rate of change
         
         Args:
             run_data: DataFrame slice containing a power run
+            debug_mode: If True, print debug information about calculations
             
         Returns:
             Tuple of (power_hp, torque_lbft) arrays
@@ -467,6 +528,14 @@ class PowerAnalyzer:
         # Calculate vehicle acceleration from RPM change and gearing
         rpm = run_data['Engine Speed'].values
         time_data = run_data['Section Time'].values
+        
+        if debug_mode:
+            print(f"\n=== DEBUG: Power Calculation for {len(rpm)} data points ===")
+            print(f"RPM range: {rpm[0]:.0f} - {rpm[-1]:.0f}")
+            print(f"Time range: {time_data[0]:.3f} - {time_data[-1]:.3f}s")
+            print(f"First 10 RPM values: {rpm[:10]}")
+            print(f"RPM differences: {np.diff(rpm[:10])}")
+            print(f"Time steps: {np.diff(time_data[:10])}")
         
         # Calculate wheel RPM from engine RPM
         wheel_rpm = rpm / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
@@ -476,16 +545,59 @@ class PowerAnalyzer:
         tire_radius_m = self.vehicle_specs.tire_circumference_m / (2 * np.pi)
         vehicle_speed_ms = wheel_speed_rad_per_sec * tire_radius_m
         
-        # Calculate acceleration from vehicle speed change
-        # Use numpy gradient for smooth differentiation
-        time_step = np.mean(np.diff(time_data))  # Average time step
-        acceleration = np.gradient(vehicle_speed_ms, time_step)
+        if debug_mode:
+            print(f"Vehicle speed first 10 values: {vehicle_speed_ms[:10]}")
+            print(f"Speed differences: {np.diff(vehicle_speed_ms[:10])}")
         
-        # Smooth the acceleration to reduce noise
-        if len(acceleration) > 5:
-            # Apply Gaussian smoothing with configurable factor
-            sigma = self.smoothing_factor * min(2.0, len(acceleration) / 10.0)
-            acceleration = gaussian_filter1d(acceleration, sigma=sigma)
+        # Calculate acceleration from vehicle speed change
+        time_step = np.mean(np.diff(time_data))  # Average time step
+        
+        # For high-frequency data (small time steps), use more robust differentiation
+        if time_step < 0.01:  # Less than 10ms between samples
+            if debug_mode:
+                print(f"High-frequency data detected (dt={time_step:.4f}s), using robust differentiation")
+            
+            # Pre-smooth vehicle speed for high-frequency data to reduce noise amplification
+            if len(vehicle_speed_ms) > 5:
+                # Apply light pre-smoothing proportional to data frequency
+                pre_smooth_sigma = max(0.5, 3.0 * time_step / 0.001)  # Scale with frequency
+                vehicle_speed_smoothed = gaussian_filter1d(vehicle_speed_ms, sigma=pre_smooth_sigma)
+                if debug_mode:
+                    print(f"Pre-smoothing vehicle speed with sigma={pre_smooth_sigma:.2f}")
+                    print(f"Speed smoothing reduced variation by {(np.std(vehicle_speed_ms) - np.std(vehicle_speed_smoothed)) / np.std(vehicle_speed_ms) * 100:.1f}%")
+            else:
+                vehicle_speed_smoothed = vehicle_speed_ms
+            
+            # Use central difference on smoothed data
+            acceleration = np.gradient(vehicle_speed_smoothed, time_step)
+        else:
+            # For normal frequency data, use standard gradient
+            acceleration = np.gradient(vehicle_speed_ms, time_step)
+        
+        if debug_mode:
+            print(f"Raw acceleration first 10 values: {acceleration[:10]}")
+            print(f"Acceleration range: {np.min(acceleration):.3f} to {np.max(acceleration):.3f} m/s²")
+        
+        # Apply additional smoothing if needed (less aggressive for high-frequency data)
+        if len(acceleration) > 5 and self.smoothing_factor > 0:
+            if time_step < 0.01:
+                # For high-frequency data, use lighter additional smoothing since we pre-smoothed
+                sigma = self.smoothing_factor * min(1.0, len(acceleration) / 15.0)
+            else:
+                # For normal frequency data, use standard smoothing
+                sigma = self.smoothing_factor * min(2.0, len(acceleration) / 10.0)
+            
+            if sigma > 0.1:  # Only smooth if sigma is meaningful
+                acceleration_smoothed = gaussian_filter1d(acceleration, sigma=sigma)
+                if debug_mode:
+                    print(f"Additional smoothing applied with sigma: {sigma:.3f}")
+                    print(f"Acceleration smoothing reduced oscillation by {(np.std(np.diff(acceleration)) - np.std(np.diff(acceleration_smoothed))) / np.std(np.diff(acceleration)) * 100:.1f}%")
+                    print(f"Final smoothed acceleration first 10 values: {acceleration_smoothed[:10]}")
+                acceleration = acceleration_smoothed
+            elif debug_mode:
+                print(f"Skipping additional smoothing (sigma={sigma:.3f} too small)")
+        elif debug_mode:
+            print("No additional smoothing applied")
         
         # Calculate force required to accelerate the vehicle
         mass_kg = self.vehicle_specs.total_weight_kg
@@ -964,6 +1076,8 @@ Examples:
                        help='Number of frames to trim from start/end of each run for cleaner data (default: 20)')
     parser.add_argument('--max-gap', type=int, default=5, 
                        help='Maximum consecutive invalid samples allowed before ending a power run (default: 5)')
+    parser.add_argument('--downsample-hz', type=float, default=None, 
+                       help='Downsample data to specified frequency in Hz (e.g., 50 for high-frequency ECU logs)')
     
     # Analysis parameters
     parser.add_argument('--min-duration', type=float, default=1.0, 
@@ -1005,7 +1119,8 @@ Examples:
             apply_hp_torque_correction=not args.no_hp_torque_correction,
             filter_rpm_data=not args.no_rpm_filtering,
             trim_frames=args.trim_frames,
-            max_gap=args.max_gap
+            max_gap=args.max_gap,
+            downsample_hz=args.downsample_hz
         )
         
         analyzer.load_data(args.csv_file)
