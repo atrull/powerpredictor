@@ -112,13 +112,14 @@ class PowerAnalyzer:
     
     def _filter_rpm_data(self) -> None:
         """
-        Enhanced RPM data filtering for ECUs with poor synchronization
-        Uses multi-stage approach: outlier detection, trend analysis, and adaptive smoothing
+        Advanced RPM data filtering for ECUs with poor synchronization
+        Uses multi-stage approach: outlier detection, trend validation, and adaptive smoothing
         """
         if 'Engine Speed' not in self.data.columns or 'Section Time' not in self.data.columns:
             return
         
         pd = _import_pandas()
+        signal, gaussian_filter1d, savgol_filter = _import_scipy()
         
         rpm_col = 'Engine Speed'
         time_col = 'Section Time'
@@ -127,7 +128,7 @@ class PowerAnalyzer:
         # Make a copy to work with
         filtered_data = self.data.copy()
         
-        rpm_values = filtered_data[rpm_col].values.copy().astype(float)  # Convert to float to allow NaN
+        rpm_values = filtered_data[rpm_col].values.copy().astype(float)
         time_values = filtered_data[time_col].values
         tps_values = filtered_data[tps_col].values if tps_col in filtered_data.columns else np.full(len(rpm_values), 0)
         
@@ -136,56 +137,60 @@ class PowerAnalyzer:
         
         problems_found = 0
         outliers_found = 0
+        trend_violations = 0
         
-        # Stage 1: Remove exact duplicates
+        # Stage 1: Remove exact duplicates and clearly erroneous values
         for i in range(1, len(rpm_values)):
             if pd.notna(rpm_values[i]) and pd.notna(rpm_values[i-1]):
+                # Remove exact duplicates at different timestamps
                 if (rpm_values[i] == rpm_values[i-1] and 
                     time_values[i] != time_values[i-1]):
                     rpm_values[i] = np.nan
                     problems_found += 1
+                # Remove negative RPM values (clearly impossible)
+                elif rpm_values[i] < 0:
+                    rpm_values[i] = np.nan
+                    problems_found += 1
         
-        # Stage 2: Enhanced outlier detection using physical constraints
-        max_rpm_per_sec = 1500  # Maximum realistic RPM/sec acceleration at WOT
+        # Stage 2: Enhanced outlier detection with median filtering
+        window_size = 5
+        median_filtered = signal.medfilt(rpm_values, kernel_size=window_size)
         
-        for i in range(1, len(rpm_values) - 1):
-            if pd.notna(rpm_values[i-1]) and pd.notna(rpm_values[i]) and pd.notna(rpm_values[i+1]):
-                dt_prev = time_deltas[i-1] if i-1 < len(time_deltas) else 0.02
-                dt_next = time_deltas[i] if i < len(time_deltas) else 0.02
-                
-                # Calculate acceleration rates
-                accel_in = (rpm_values[i] - rpm_values[i-1]) / dt_prev if dt_prev > 0 else 0
-                accel_out = (rpm_values[i+1] - rpm_values[i]) / dt_next if dt_next > 0 else 0
-                
-                # Check for physically impossible accelerations or direction reversals
-                is_outlier = False
-                
-                # High TPS with impossible RPM drops
-                if tps_values[i] > 95 and accel_in < -500:
-                    is_outlier = True
-                
-                # Sudden direction changes that exceed physical limits
-                if abs(accel_in) > max_rpm_per_sec or abs(accel_out) > max_rpm_per_sec:
-                    # Check if this is a genuine outlier vs normal acceleration
-                    if abs(accel_in - accel_out) > max_rpm_per_sec:
-                        is_outlier = True
-                
-                # RPM value significantly out of local trend
-                if i >= 2 and i < len(rpm_values) - 2:
-                    local_trend = np.median([rpm_values[i-2], rpm_values[i-1], rpm_values[i+1], rpm_values[i+2]])
-                    if abs(rpm_values[i] - local_trend) > 100:  # More than 100 RPM from local median
-                        is_outlier = True
-                
-                if is_outlier:
+        # Find outliers that deviate significantly from median-filtered signal
+        for i in range(len(rpm_values)):
+            if pd.notna(rpm_values[i]) and pd.notna(median_filtered[i]):
+                deviation = abs(rpm_values[i] - median_filtered[i])
+                # More aggressive outlier detection for large deviations
+                if deviation > 150:  # RPM significantly different from local median
                     rpm_values[i] = np.nan
                     outliers_found += 1
         
-        # Stage 3: Multi-pass trend-based smoothing for WOT sections
-        wot_mask = tps_values > 95  # Wide open throttle detection
+        # Stage 3: Trend-based validation for WOT sections
+        wot_mask = tps_values > 95
+        max_rpm_per_sec = 2000  # Slightly more generous limit
         
-        # Apply Savitzky-Golay filter to WOT sections for better trend preservation
+        # Apply trend validation in WOT sections
+        for i in range(1, len(rpm_values) - 1):
+            if (wot_mask[i] and pd.notna(rpm_values[i-1]) and 
+                pd.notna(rpm_values[i]) and pd.notna(rpm_values[i+1])):
+                
+                dt_prev = time_deltas[i-1] if i-1 < len(time_deltas) else 0.02
+                dt_next = time_deltas[i] if i < len(time_deltas) else 0.02
+                
+                # During WOT, RPM should generally increase or stay stable
+                if dt_prev > 0:
+                    accel_rate = (rpm_values[i] - rpm_values[i-1]) / dt_prev
+                    
+                    # Flag massive drops during WOT as trend violations
+                    if accel_rate < -800:  # More than 800 RPM/sec drop during WOT
+                        rpm_values[i] = np.nan
+                        trend_violations += 1
+                    # Also flag impossible accelerations
+                    elif abs(accel_rate) > max_rpm_per_sec:
+                        rpm_values[i] = np.nan
+                        trend_violations += 1
         
-        # Find continuous WOT sections
+        # Stage 4: Find and process WOT sections with enhanced smoothing
         wot_sections = []
         in_wot = False
         start_idx = None
@@ -195,7 +200,7 @@ class PowerAnalyzer:
                 start_idx = i
                 in_wot = True
             elif not is_wot and in_wot:
-                if start_idx is not None and i - start_idx > 10:  # At least 10 samples
+                if start_idx is not None and i - start_idx > 10:
                     wot_sections.append((start_idx, i))
                 in_wot = False
                 start_idx = None
@@ -204,32 +209,48 @@ class PowerAnalyzer:
         if in_wot and start_idx is not None:
             wot_sections.append((start_idx, len(wot_mask)))
         
-        # Apply enhanced smoothing to each WOT section
+        # Process each WOT section with adaptive smoothing
         for start, end in wot_sections:
             section_rpm = rpm_values[start:end].copy()
             section_time = time_values[start:end]
-            
-            # First, interpolate any remaining NaN values in this section
             section_mask = ~np.isnan(section_rpm)
+            
             if np.sum(section_mask) > 5:  # Need at least 5 valid points
-                # Linear interpolation for gaps
-                section_rpm = np.interp(
-                    section_time,
-                    section_time[section_mask],
-                    section_rpm[section_mask]
-                )
+                # First, interpolate any NaN values
+                if np.any(~section_mask):
+                    section_rpm = np.interp(
+                        section_time,
+                        section_time[section_mask],
+                        section_rpm[section_mask]
+                    )
                 
-                # Apply smoothing filter if section is long enough
-                if len(section_rpm) >= 10:
-                    # Use moving average for now to avoid savgol complexity
-                    window = min(7, len(section_rpm) // 3)
-                    if window >= 3:
-                        section_rpm = pd.Series(section_rpm).rolling(window=window, center=True).mean().bfill().ffill().values
+                # Apply adaptive smoothing based on section length
+                if len(section_rpm) >= 15:
+                    # For longer sections, use Savitzky-Golay filter
+                    try:
+                        window_length = min(11, len(section_rpm) // 2)
+                        if window_length % 2 == 0:
+                            window_length -= 1
+                        if window_length >= 5:
+                            section_rpm = savgol_filter(section_rpm, window_length, 3)
+                    except:
+                        # Fallback to Gaussian smoothing
+                        sigma = len(section_rpm) / 20.0
+                        section_rpm = gaussian_filter1d(section_rpm, sigma=sigma)
+                
+                elif len(section_rpm) >= 7:
+                    # For medium sections, use Gaussian smoothing
+                    sigma = len(section_rpm) / 15.0
+                    section_rpm = gaussian_filter1d(section_rpm, sigma=sigma)
+                
+                # Apply monotonicity constraint for WOT sections
+                # RPM should generally increase during acceleration
+                section_rpm = self._apply_monotonicity_constraint(section_rpm, section_time)
                 
                 # Update the main array
                 rpm_values[start:end] = section_rpm
         
-        # Stage 4: Final interpolation for any remaining NaN values
+        # Stage 5: Final interpolation for any remaining NaN values
         rpm_mask = ~np.isnan(rpm_values)
         if np.sum(rpm_mask) > 0:
             rpm_values = np.interp(
@@ -241,12 +262,98 @@ class PowerAnalyzer:
         # Update the filtered data
         filtered_data[rpm_col] = rpm_values
         
-        total_issues = problems_found + outliers_found
+        total_issues = problems_found + outliers_found + trend_violations
         if total_issues > 0:
-            print(f"Enhanced RPM filtering: {problems_found} duplicates, {outliers_found} outliers, {len(wot_sections)} WOT sections smoothed")
+            print(f"Advanced RPM filtering: {problems_found} bad values, {outliers_found} outliers, "
+                  f"{trend_violations} trend violations, {len(wot_sections)} WOT sections processed")
         
         # Update the main data
         self.data = filtered_data
+    
+    def _apply_monotonicity_constraint(self, rpm_values: np.ndarray, time_values: np.ndarray) -> np.ndarray:
+        """
+        Apply monotonicity constraint to RPM values during acceleration
+        Ensures RPM generally increases during WOT pulls while allowing for minor variations
+        """
+        if len(rpm_values) < 3:
+            return rpm_values
+        
+        corrected_rpm = rpm_values.copy()
+        
+        # Calculate the overall trend
+        time_span = time_values[-1] - time_values[0]
+        overall_rpm_rate = (rpm_values[-1] - rpm_values[0]) / time_span if time_span > 0 else 0
+        
+        # Only apply constraint if we're clearly in an acceleration phase
+        if overall_rpm_rate > 100:  # More than 100 RPM/sec average increase
+            # Smooth out backwards steps while preserving natural variation
+            for i in range(1, len(corrected_rpm)):
+                # Calculate expected RPM based on trend
+                dt = time_values[i] - time_values[i-1] if i > 0 else 0.02
+                expected_increase = overall_rpm_rate * dt * 0.5  # Allow 50% of average rate
+                
+                # If RPM decreases significantly, adjust it
+                if corrected_rpm[i] < corrected_rpm[i-1] - expected_increase:
+                    # Use a weighted average between current value and trend-based value
+                    trend_value = corrected_rpm[i-1] + expected_increase * 0.5
+                    corrected_rpm[i] = 0.7 * corrected_rpm[i] + 0.3 * trend_value
+        
+        return corrected_rpm
+    
+    def _apply_dyno_style_smoothing(self, power_hp: np.ndarray, torque_lbft: np.ndarray, rpm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply dyno-style smoothing that balances noise reduction with curve characteristics
+        Based on the reference dyno graph analysis for realistic smoothing
+        """
+        signal, gaussian_filter1d, savgol_filter = _import_scipy()
+        
+        # Apply different smoothing strategies based on data length
+        data_length = len(power_hp)
+        
+        if data_length >= 20:
+            # For longer datasets, use Savitzky-Golay filter for better edge preservation
+            try:
+                # Dynamic window sizing based on data length and smoothing factor
+                window_length = int(max(5, min(15, data_length * self.smoothing_factor / 10.0)))
+                if window_length % 2 == 0:
+                    window_length += 1  # Ensure odd number
+                
+                # Use polynomial order 3 for smooth curves with good dynamics
+                poly_order = min(3, window_length - 1)
+                
+                smoothed_power = savgol_filter(power_hp, window_length, poly_order)
+                smoothed_torque = savgol_filter(torque_lbft, window_length, poly_order)
+                
+                # Apply light Gaussian post-processing for final smoothness
+                if self.smoothing_factor > 2.0:
+                    light_sigma = self.smoothing_factor * 0.3
+                    smoothed_power = gaussian_filter1d(smoothed_power, sigma=light_sigma)
+                    smoothed_torque = gaussian_filter1d(smoothed_torque, sigma=light_sigma)
+                
+            except (ValueError, np.linalg.LinAlgError):
+                # Fallback to Gaussian smoothing
+                sigma = self.smoothing_factor * min(1.5, data_length / 15.0)
+                smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
+                smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
+        
+        elif data_length >= 10:
+            # For medium datasets, use adaptive Gaussian smoothing
+            sigma = self.smoothing_factor * min(1.2, data_length / 12.0)
+            smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
+            smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
+        
+        else:
+            # For short datasets, minimal smoothing to preserve what little data we have
+            sigma = self.smoothing_factor * 0.5
+            smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
+            smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
+        
+        # Ensure HP-Torque relationship is maintained after smoothing
+        if self.apply_hp_torque_correction:
+            # Recalculate power from smoothed torque to maintain 5252 RPM crossover
+            smoothed_power = (smoothed_torque * rpm) / 5252
+        
+        return smoothed_power, smoothed_torque
     
     def find_power_runs(self, min_duration: float = 1.0, min_rpm_range: float = 2500, 
                        throttle_threshold: float = 96) -> List[Dict]:
@@ -416,11 +523,11 @@ class PowerAnalyzer:
         else:
             corrected_power_hp = power_hp
         
-        # Apply smoothing to final power and torque curves
+        # Apply advanced smoothing to final power and torque curves
         if len(corrected_power_hp) > 5 and self.smoothing_factor > 0:
-            sigma = self.smoothing_factor * min(1.5, len(corrected_power_hp) / 15.0)
-            corrected_power_hp = gaussian_filter1d(corrected_power_hp, sigma=sigma)
-            torque_lbft = gaussian_filter1d(torque_lbft, sigma=sigma)
+            corrected_power_hp, torque_lbft = self._apply_dyno_style_smoothing(
+                corrected_power_hp, torque_lbft, run_data['Engine Speed'].values
+            )
         
         return corrected_power_hp, torque_lbft
     
