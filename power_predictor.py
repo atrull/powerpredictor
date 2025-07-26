@@ -103,6 +103,19 @@ class PowerAnalyzer:
                 if col in self.data.columns:
                     self.data[col] = pd.to_numeric(self.data[col], errors='coerce')
             
+            # Assess data quality and provide recommendations
+            quality_metrics = self._assess_data_quality()
+            
+            # Detect optimal frequency if auto-downsampling not specified
+            if self.downsample_hz is None:
+                recommended_freq = self._detect_optimal_frequency()
+                if recommended_freq and quality_metrics.get('quality_level') == 'needs_cleanup':
+                    print(f"Auto-enabling downsampling to {recommended_freq}Hz due to data quality")
+                    self.downsample_hz = recommended_freq
+            
+            # Apply generic parameter cleanup before RPM filtering
+            self._cleanup_critical_parameters()
+            
             # Filter RPM data to handle ECU reporting issues
             if self.filter_rpm_data:
                 self._filter_rpm_data()
@@ -140,6 +153,9 @@ class PowerAnalyzer:
         time_values = filtered_data[time_col].values
         tps_values = filtered_data[tps_col].values if tps_col in filtered_data.columns else np.full(len(rpm_values), 0)
         
+        # Create WOT mask for stair-step detection
+        wot_mask = tps_values > 95
+        
         # Calculate time deltas for physical constraint checking
         time_deltas = np.diff(time_values)
         
@@ -160,6 +176,32 @@ class PowerAnalyzer:
                     rpm_values[i] = np.nan
                     problems_found += 1
         
+        # Stage 1.5: Enhanced stair-step detection for RPM plateaus during WOT
+        stair_step_fixes = 0
+        for i in range(2, len(rpm_values) - 2):
+            if (wot_mask[i] and pd.notna(rpm_values[i-2:i+3]).all()):
+                # Check for flat segments during WOT acceleration
+                window = rpm_values[i-2:i+3]
+                time_window = time_values[i-2:i+3]
+                
+                # Calculate expected RPM trend
+                time_span = time_window[-1] - time_window[0]
+                if time_span > 0.05:  # At least 50ms span
+                    # Check if middle values are flat while we should be accelerating
+                    if (abs(window[1] - window[2]) < 1 and abs(window[2] - window[3]) < 1 and
+                        window[4] > window[0] + 10):  # Overall increasing trend
+                        
+                        # Apply micro-smoothing to flat segment using linear interpolation
+                        rpm_values[i-1:i+2] = np.interp(
+                            time_window[1:4], 
+                            [time_window[0], time_window[4]], 
+                            [window[0], window[4]]
+                        )
+                        stair_step_fixes += 1
+        
+        if stair_step_fixes > 0:
+            print(f"Enhanced RPM stair-step fixes applied: {stair_step_fixes} plateau segments smoothed")
+        
         # Stage 2: Enhanced outlier detection with median filtering
         window_size = 5
         median_filtered = signal.medfilt(rpm_values, kernel_size=window_size)
@@ -173,8 +215,7 @@ class PowerAnalyzer:
                     rpm_values[i] = np.nan
                     outliers_found += 1
         
-        # Stage 3: Trend-based validation for WOT sections
-        wot_mask = tps_values > 95
+        # Stage 3: Trend-based validation for WOT sections  
         max_rpm_per_sec = 2000  # Slightly more generous limit
         
         # Apply trend validation in WOT sections
@@ -278,6 +319,153 @@ class PowerAnalyzer:
         # Update the main data
         self.data = filtered_data
     
+    def _apply_generic_parameter_cleanup(self, data, column_name: str, time_column: str = 'Section Time') -> np.ndarray:
+        """
+        Generic forward-averaging cleanup for stair-step ECU data
+        
+        Addresses the "stairs vs angle" problem by detecting flat segments
+        and interpolating smooth transitions between stable values.
+        
+        Args:
+            data: DataFrame containing the data
+            column_name: Name of the parameter column to clean
+            time_column: Name of the time column
+            
+        Returns:
+            Cleaned parameter values as numpy array
+        """
+        if column_name not in data.columns:
+            return None
+            
+        pd = _import_pandas()
+        values = data[column_name].values.copy().astype(float)
+        time_values = data[time_column].values
+        
+        # Remove NaN values for processing
+        valid_mask = ~pd.isna(values)
+        if np.sum(valid_mask) < 3:
+            return values
+        
+        # Detect stair-step pattern: consecutive identical values with time progression
+        change_points = [0]  # Start with first point
+        tolerance = 0.001  # Small tolerance for floating point comparison
+        
+        for i in range(1, len(values)):
+            if valid_mask[i] and valid_mask[i-1]:
+                if abs(values[i] - values[i-1]) > tolerance:
+                    change_points.append(i)
+        
+        change_points.append(len(values) - 1)  # End with last point
+        
+        if len(change_points) < 3:  # Need at least start, middle, end
+            return values
+        
+        # Apply forward moving average between change points
+        smoothed_values = values.copy()
+        
+        for i in range(len(change_points) - 1):
+            start_idx = change_points[i]
+            end_idx = change_points[i + 1]
+            
+            if end_idx - start_idx > 2:  # Only smooth segments with multiple flat points
+                segment_time = time_values[start_idx:end_idx+1]
+                start_val = values[start_idx]
+                end_val = values[end_idx]
+                
+                # Create smooth transition using linear interpolation
+                # This preserves the trend while smoothing the stair-step pattern
+                if len(segment_time) > 1 and segment_time[-1] != segment_time[0]:
+                    smoothed_segment = np.interp(segment_time, 
+                                               [segment_time[0], segment_time[-1]], 
+                                               [start_val, end_val])
+                    smoothed_values[start_idx:end_idx+1] = smoothed_segment
+        
+        return smoothed_values
+
+    def _assess_data_quality(self):
+        """Assess data quality and recommend processing approach"""
+        quality_metrics = {}
+        
+        # Check for stair-step patterns in key parameters
+        if 'Engine Speed' in self.data.columns:
+            rpm_changes = np.diff(self.data['Engine Speed'].dropna())
+            zero_changes = np.sum(np.abs(rpm_changes) < 0.001)
+            quality_metrics['rpm_stair_step_ratio'] = zero_changes / len(rpm_changes) if len(rpm_changes) > 0 else 0
+        
+        # Detect logging frequency
+        time_diffs = np.diff(self.data['Section Time'].values)
+        quality_metrics['avg_sample_rate'] = 1.0 / np.mean(time_diffs) if len(time_diffs) > 0 else 0
+        quality_metrics['sample_rate_std'] = np.std(time_diffs)
+        
+        # Count total parameters
+        quality_metrics['total_parameters'] = len(self.data.columns)
+        
+        # Assess overall data quality
+        if quality_metrics['rpm_stair_step_ratio'] > 0.3:
+            quality_metrics['quality_level'] = 'needs_cleanup'
+            print(f"High stair-step pattern detected ({quality_metrics['rpm_stair_step_ratio']:.1%}) - enhanced smoothing recommended")
+        elif quality_metrics['rpm_stair_step_ratio'] > 0.1:
+            quality_metrics['quality_level'] = 'moderate_cleanup'
+            print(f"Moderate stair-step pattern detected ({quality_metrics['rpm_stair_step_ratio']:.1%}) - light cleanup recommended")
+        else:
+            quality_metrics['quality_level'] = 'good'
+            print(f"Good data quality detected ({quality_metrics['rpm_stair_step_ratio']:.1%} flat segments)")
+        
+        print(f"Data characteristics: {quality_metrics['avg_sample_rate']:.1f}Hz sampling, {quality_metrics['total_parameters']} parameters")
+        
+        return quality_metrics
+
+    def _detect_optimal_frequency(self):
+        """Detect optimal processing frequency based on data characteristics"""
+        time_diffs = np.diff(self.data['Section Time'].values)
+        avg_freq = 1.0 / np.mean(time_diffs)
+        
+        # Determine optimal frequency based on current frequency and data quality
+        if avg_freq > 200:  # High frequency like k20_pull.csv
+            recommended_freq = 50  # Downsample significantly
+            print(f"High frequency data detected ({avg_freq:.1f}Hz) - recommending {recommended_freq}Hz for analysis")
+        elif avg_freq > 100:
+            recommended_freq = 25  # Moderate downsampling
+            print(f"Medium frequency data detected ({avg_freq:.1f}Hz) - recommending {recommended_freq}Hz for analysis")
+        elif avg_freq > 75:
+            recommended_freq = None  # Light downsampling or none
+            print(f"Good frequency data detected ({avg_freq:.1f}Hz) - no downsampling needed")
+        else:
+            recommended_freq = None  # No downsampling needed
+            print(f"Standard frequency data detected ({avg_freq:.1f}Hz) - optimal for analysis")
+        
+        return recommended_freq
+
+    def _cleanup_critical_parameters(self):
+        """Apply generic cleanup to critical ECU parameters that commonly show stair-step patterns"""
+        critical_params = [
+            'Engine Speed', 'TPS (Main)', 'TPS 2(Main)', 'MAP', 
+            'Lambda 1', 'Lambda Avg', 'IAT', 'BAP'
+        ]
+        
+        cleaned_count = 0
+        for param in critical_params:
+            if param in self.data.columns:
+                original_values = self.data[param].values.copy()
+                cleaned_values = self._apply_generic_parameter_cleanup(self.data, param)
+                
+                if cleaned_values is not None:
+                    # Calculate improvement metric
+                    original_changes = np.diff(original_values[~np.isnan(original_values)])
+                    cleaned_changes = np.diff(cleaned_values[~np.isnan(cleaned_values)])
+                    
+                    if len(original_changes) > 0 and len(cleaned_changes) > 0:
+                        original_zeros = np.sum(np.abs(original_changes) < 0.001)
+                        cleaned_zeros = np.sum(np.abs(cleaned_changes) < 0.001)
+                        
+                        if original_zeros > cleaned_zeros:
+                            self.data[param] = cleaned_values
+                            cleaned_count += 1
+                            print(f"Applied stair-step cleanup to {param}: reduced flat segments from {original_zeros} to {cleaned_zeros}")
+        
+        if cleaned_count > 0:
+            print(f"Generic cleanup applied to {cleaned_count} parameters")
+
     def _apply_monotonicity_constraint(self, rpm_values: np.ndarray, time_values: np.ndarray) -> np.ndarray:
         """
         Apply monotonicity constraint to RPM values during acceleration
@@ -307,6 +495,48 @@ class PowerAnalyzer:
                     corrected_rpm[i] = 0.7 * corrected_rpm[i] + 0.3 * trend_value
         
         return corrected_rpm
+    
+    def _smooth_rpm_steps(self, power_hp: np.ndarray, torque_lbft: np.ndarray, rpm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Targeted smoothing to eliminate small RPM step artifacts (like 200 RPM increments)
+        while preserving the overall power curve characteristics
+        """
+        signal, gaussian_filter1d, savgol_filter = _import_scipy()
+        
+        # Detect RPM steps - look for regular increments
+        rpm_diffs = np.diff(rpm)
+        median_step = np.median(rpm_diffs[rpm_diffs > 0])
+        
+        # If we have regular steps (like 100-300 RPM), apply targeted smoothing
+        if 50 < median_step < 500:  # Reasonable RPM step range
+            print(f"Detected RPM steps of ~{median_step:.0f} RPM - applying targeted smoothing")
+            
+            # Use a small window that spans ~2-3 RPM steps
+            window_size = max(3, min(7, int(len(power_hp) / 20)))
+            if window_size % 2 == 0:
+                window_size += 1
+            
+            try:
+                # Light Savitzky-Golay filtering to smooth steps but preserve curve shape
+                smoothed_power = savgol_filter(power_hp, window_size, min(2, window_size-1))
+                smoothed_torque = savgol_filter(torque_lbft, window_size, min(2, window_size-1))
+                print(f"Applied light SavGol smoothing: window={window_size}")
+                
+            except (ValueError, np.linalg.LinAlgError):
+                # Fallback to very light Gaussian
+                sigma = 1.0
+                smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
+                smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
+                print(f"Applied light Gaussian smoothing: σ={sigma}")
+                
+        else:
+            # No regular steps detected, minimal smoothing
+            print(f"No regular RPM steps detected (median: {median_step:.0f}) - minimal smoothing")
+            sigma = 0.5
+            smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
+            smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
+        
+        return smoothed_power, smoothed_torque
     
     def _downsample_data(self, target_hz: float):
         """
@@ -363,14 +593,25 @@ class PowerAnalyzer:
     def _apply_dyno_style_smoothing(self, power_hp: np.ndarray, torque_lbft: np.ndarray, rpm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Apply dyno-style smoothing that balances noise reduction with curve characteristics
-        Based on the reference dyno graph analysis for realistic smoothing
+        Enhanced for high-frequency downsampled data to eliminate remaining artifacts
         """
         signal, gaussian_filter1d, savgol_filter = _import_scipy()
         
         # Apply different smoothing strategies based on data length
         data_length = len(power_hp)
         
-        if data_length >= 20:
+        # Check if this data was heavily downsampled (indicator of high-frequency source)
+        was_downsampled = hasattr(self, 'downsample_hz') and self.downsample_hz is not None
+        
+        # Targeted RPM-step smoothing for downsampled high-frequency data
+        if was_downsampled and data_length > 20:
+            print(f"Applying targeted RPM-step smoothing for downsampled data ({data_length} points)")
+            
+            # Target small RPM increments (like 200 RPM steps) without destroying overall curve
+            smoothed_power, smoothed_torque = self._smooth_rpm_steps(power_hp, torque_lbft, rpm)
+            print(f"Applied targeted RPM-step smoothing to preserve power characteristics")
+                
+        elif data_length >= 20:
             # For longer datasets, use Savitzky-Golay filter for better edge preservation
             try:
                 # Dynamic window sizing based on data length and smoothing factor
@@ -552,15 +793,25 @@ class PowerAnalyzer:
         # Calculate acceleration from vehicle speed change
         time_step = np.mean(np.diff(time_data))  # Average time step
         
-        # For high-frequency data (small time steps), use more robust differentiation
-        if time_step < 0.01:  # Less than 10ms between samples
+        # Check if this is downsampled high-frequency data
+        was_downsampled = hasattr(self, 'downsample_hz') and self.downsample_hz is not None
+        
+        # For high-frequency data or downsampled data, use more robust differentiation
+        if time_step < 0.01 or was_downsampled:  # Less than 10ms between samples OR was downsampled
             if debug_mode:
-                print(f"High-frequency data detected (dt={time_step:.4f}s), using robust differentiation")
+                print(f"High-frequency/downsampled data detected (dt={time_step:.4f}s), using robust differentiation")
             
             # Pre-smooth vehicle speed for high-frequency data to reduce noise amplification
             if len(vehicle_speed_ms) > 5:
-                # Apply light pre-smoothing proportional to data frequency
-                pre_smooth_sigma = max(0.5, 3.0 * time_step / 0.001)  # Scale with frequency
+                # Enhanced pre-smoothing for downsampled high-frequency data
+                if was_downsampled:
+                    # Light smoothing for downsampled data - just remove micro-artifacts
+                    pre_smooth_sigma = max(0.5, 1.0 * time_step / 0.001)
+                    print(f"Light pre-smoothing for downsampled data: σ={pre_smooth_sigma:.2f}")
+                else:
+                    # Apply light pre-smoothing proportional to data frequency
+                    pre_smooth_sigma = max(0.5, 3.0 * time_step / 0.001)  # Scale with frequency
+                
                 vehicle_speed_smoothed = gaussian_filter1d(vehicle_speed_ms, sigma=pre_smooth_sigma)
                 if debug_mode:
                     print(f"Pre-smoothing vehicle speed with sigma={pre_smooth_sigma:.2f}")
@@ -578,9 +829,13 @@ class PowerAnalyzer:
             print(f"Raw acceleration first 10 values: {acceleration[:10]}")
             print(f"Acceleration range: {np.min(acceleration):.3f} to {np.max(acceleration):.3f} m/s²")
         
-        # Apply additional smoothing if needed (less aggressive for high-frequency data)
+        # Apply additional smoothing if needed (enhanced for downsampled data)
         if len(acceleration) > 5 and self.smoothing_factor > 0:
-            if time_step < 0.01:
+            if was_downsampled:
+                # Very light smoothing for downsampled data - preserve power characteristics
+                sigma = self.smoothing_factor * min(0.8, len(acceleration) / 20.0)
+                print(f"Light acceleration smoothing for downsampled data: σ={sigma:.2f}")
+            elif time_step < 0.01:
                 # For high-frequency data, use lighter additional smoothing since we pre-smoothed
                 sigma = self.smoothing_factor * min(1.0, len(acceleration) / 15.0)
             else:
