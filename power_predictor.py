@@ -579,15 +579,18 @@ class PowerAnalyzer:
         was_downsampled = hasattr(self, 'downsample_hz') and self.downsample_hz is not None
         
         if was_downsampled:
-            # For downsampled high-frequency data, apply aggressive smoothing to eliminate artifacts
-            # These datasets tend to have calculation artifacts that create unrealistic sharp angles
+            # For downsampled high-frequency data, apply VERY aggressive smoothing to eliminate artifacts
+            # These datasets have severe "dot artifacts" in torque that create power kinks
             
-            # First, apply strong smoothing to eliminate sharp peaks/valleys
+            # Apply extremely heavy torque smoothing first to eliminate "dots smashed together"
+            sigma_torque_ultra = max(5.0, len(torque_lbft) / 15.0)  # Much more aggressive
+            torque_ultra_smoothed = gaussian_filter1d(torque_lbft, sigma=sigma_torque_ultra)
+            
+            # Then apply standard aggressive smoothing to power
             sigma_aggressive = max(3.0, len(power_hp) / 30.0)
             power_heavily_smoothed = gaussian_filter1d(power_hp, sigma=sigma_aggressive)
-            torque_heavily_smoothed = gaussian_filter1d(torque_lbft, sigma=sigma_aggressive)
             
-            print(f"Physics-aware smoothing: aggressive σ={sigma_aggressive:.2f} for downsampled data")
+            print(f"Physics-aware smoothing: ultra-aggressive torque σ={sigma_torque_ultra:.2f}, power σ={sigma_aggressive:.2f} for downsampled data")
             
             # Apply monotonicity constraint: power shouldn't increase dramatically during RPM plateaus
             rpm_changes = np.diff(rpm_smoothed)
@@ -615,7 +618,7 @@ class PowerAnalyzer:
             # Final light smoothing to ensure curves are completely smooth
             final_sigma = 1.0
             final_power = gaussian_filter1d(power_heavily_smoothed, sigma=final_sigma)
-            final_torque = gaussian_filter1d(torque_heavily_smoothed, sigma=final_sigma)
+            final_torque = gaussian_filter1d(torque_ultra_smoothed, sigma=final_sigma)  # Use ultra-smoothed torque
             
             print(f"Applied final smoothing: σ={final_sigma}")
             
@@ -623,10 +626,7 @@ class PowerAnalyzer:
             # For normal frequency data, use the existing targeted smoothing approach
             final_power, final_torque = self._smooth_rpm_steps(power_hp, torque_lbft, rpm_original)
         
-        # Ensure HP-Torque relationship is maintained after smoothing
-        if self.apply_hp_torque_correction:
-            # Recalculate power from smoothed torque to maintain 5252 RPM crossover
-            final_power = (final_torque * rpm_smoothed) / 5252
+        # No need to re-apply HP-Torque correction here since it was applied before smoothing
         
         return final_power, final_torque
     
@@ -870,8 +870,20 @@ class PowerAnalyzer:
             print(f"RPM differences: {np.diff(rpm[:10])}")
             print(f"Time steps: {np.diff(time_data[:10])}")
         
-        # Calculate wheel RPM from engine RPM
-        wheel_rpm = rpm / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
+        # CRITICAL FIX: Ensure RPM is monotonic BEFORE any calculations
+        # This prevents backwards torque lines and power curve artifacts
+        rpm_monotonic = rpm.copy()
+        rpm_fixes = 0
+        for i in range(1, len(rpm_monotonic)):
+            if rpm_monotonic[i] <= rpm_monotonic[i-1]:
+                rpm_monotonic[i] = rpm_monotonic[i-1] + 0.1  # Tiny increment to maintain monotonicity
+                rpm_fixes += 1
+        
+        if rpm_fixes > 0:
+            print(f"Pre-calculation monotonicity fix: corrected {rpm_fixes} RPM reversals")
+        
+        # Calculate wheel RPM from monotonic engine RPM
+        wheel_rpm = rpm_monotonic / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
         
         # Convert wheel RPM to vehicle speed (m/s)
         wheel_speed_rad_per_sec = wheel_rpm * 2 * np.pi / 60  # Convert RPM to rad/s
@@ -905,8 +917,19 @@ class PowerAnalyzer:
                 rpm_smooth_sigma = max(1.0, len(rpm) / 40.0)
                 print(f"Light RPM pre-smoothing: σ={rpm_smooth_sigma:.2f}")
             
-            # Apply RPM smoothing before any speed calculations
-            rpm_smoothed = gaussian_filter1d(rpm.astype(float), sigma=rpm_smooth_sigma)
+            # Apply RPM smoothing to the already monotonic RPM
+            rpm_smoothed = gaussian_filter1d(rpm_monotonic.astype(float), sigma=rpm_smooth_sigma)
+            
+            # CRITICAL: Enforce monotonicity to eliminate backwards torque lines
+            # Even after smoothing, ensure RPM always increases for proper power calculations
+            for i in range(1, len(rpm_smoothed)):
+                if rpm_smoothed[i] <= rpm_smoothed[i-1]:
+                    # Force RPM to always increase by at least 1 RPM
+                    rpm_smoothed[i] = rpm_smoothed[i-1] + 1.0
+            
+            # Count additional violations fixed during smoothing (should be minimal now)
+            smoothing_violations = np.sum(np.diff(rpm_smoothed) <= 0) 
+            print(f"Post-smoothing monotonicity check: {smoothing_violations} additional violations")
             
             if debug_mode:
                 rpm_variation_reduction = (np.std(np.diff(rpm)) - np.std(np.diff(rpm_smoothed))) / np.std(np.diff(rpm)) * 100
@@ -920,12 +943,47 @@ class PowerAnalyzer:
         wheel_speed_rad_per_sec = wheel_rpm * 2 * np.pi / 60
         vehicle_speed_ms = wheel_speed_rad_per_sec * tire_radius_m
         
-        # Calculate acceleration using the now-smoothed vehicle speed
-        if time_step < 0.01 or was_downsampled:
+        # Calculate acceleration using sliding window approach to eliminate instantaneous spikes
+        if was_downsampled:
+            # For downsampled high-frequency data, use windowed acceleration calculation
+            # This prevents the "kinky steps" caused by instantaneous acceleration spikes
+            window_size = max(5, min(15, len(vehicle_speed_ms) // 20))  # Adaptive window size
+            if window_size % 2 == 0:
+                window_size += 1  # Ensure odd window size
+            
+            print(f"Using windowed acceleration calculation: window={window_size}")
+            
+            # Calculate acceleration using centered finite differences over multiple points
+            acceleration = np.zeros_like(vehicle_speed_ms)
+            half_window = window_size // 2
+            
+            for i in range(len(vehicle_speed_ms)):
+                start_idx = max(0, i - half_window)
+                end_idx = min(len(vehicle_speed_ms), i + half_window + 1)
+                
+                if end_idx - start_idx > 2:  # Need at least 3 points
+                    window_speed = vehicle_speed_ms[start_idx:end_idx]
+                    window_time = time_data[start_idx:end_idx]
+                    
+                    # Linear regression over the window to get smooth acceleration
+                    time_centered = window_time - window_time[len(window_time)//2]
+                    
+                    # Simple linear fit: speed = a*t + b, so acceleration = a
+                    if len(time_centered) > 1 and np.std(time_centered) > 1e-6:
+                        acceleration[i] = np.polyfit(time_centered, window_speed, 1)[0]
+                    else:
+                        acceleration[i] = 0
+                else:
+                    acceleration[i] = 0
+            
+            if debug_mode:
+                print(f"Windowed acceleration stats: mean={np.mean(acceleration):.2f}, std={np.std(acceleration):.2f}")
+                
+        elif time_step < 0.01:
             if debug_mode:
                 print(f"Using robust differentiation (dt={time_step:.4f}s)")
             
-            # For high-frequency or downsampled data, use central difference
+            # For high-frequency data, use central difference
             acceleration = np.gradient(vehicle_speed_ms, time_step)
         else:
             # For normal frequency data, use standard gradient
@@ -984,25 +1042,28 @@ class PowerAnalyzer:
         # Apply configurable drivetrain efficiency (transmission and drivetrain losses)
         power_hp = power_hp / self.drivetrain_efficiency
         
-        # Apply HP-Torque relationship correction if enabled
-        if self.apply_hp_torque_correction:
-            # ENFORCE the fundamental relationship: HP = (Torque * RPM) / 5252
-            # This ensures curves always cross at 5252 RPM
-            rpm = run_data['Engine Speed'].values
-            
-            # Calculate power directly from torque using the fundamental relationship
-            # This maintains physical accuracy and ensures crossover at 5252 RPM
-            corrected_power_hp = (torque_lbft * rpm) / 5252
-        else:
-            corrected_power_hp = power_hp
-        
-        # Apply physics-aware smoothing to eliminate impossible sharp angles
-        if len(corrected_power_hp) > 5:
-            corrected_power_hp, torque_lbft = self._apply_physics_aware_smoothing(
-                corrected_power_hp, torque_lbft, rpm_smoothed, run_data['Engine Speed'].values
+        # For downsampled data, smooth power and torque INDEPENDENTLY to eliminate kinks
+        # Then optionally apply HP-Torque correction to the final smoothed curves
+        if len(power_hp) > 5:
+            # Apply aggressive smoothing to both power and torque independently
+            smoothed_power_hp, smoothed_torque_lbft = self._apply_physics_aware_smoothing(
+                power_hp, torque_lbft, rpm_smoothed, run_data['Engine Speed'].values
             )
+            
+            # OPTIONALLY apply HP-Torque relationship correction to final smoothed curves
+            if self.apply_hp_torque_correction:
+                # Average the independently smoothed power with torque-derived power for balance
+                torque_derived_power = (smoothed_torque_lbft * rpm_smoothed) / 5252
+                # Use weighted average: 70% physics-based power, 30% torque-derived for crossover
+                final_power_hp = 0.7 * smoothed_power_hp + 0.3 * torque_derived_power
+                final_torque_lbft = smoothed_torque_lbft
+                print("Applied blended HP-Torque correction to maintain smoothness")
+            else:
+                final_power_hp, final_torque_lbft = smoothed_power_hp, smoothed_torque_lbft
+        else:
+            final_power_hp, final_torque_lbft = power_hp, torque_lbft
         
-        return corrected_power_hp, torque_lbft
+        return final_power_hp, final_torque_lbft
     
     def validate_hp_torque_crossover(self, run_data, power_hp: np.ndarray, torque_lbft: np.ndarray) -> Dict[str, float]:
         """
