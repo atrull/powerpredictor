@@ -113,18 +113,18 @@ class PowerAnalyzer:
                     print(f"Auto-enabling downsampling to {recommended_freq}Hz due to data quality")
                     self.downsample_hz = recommended_freq
             
-            # Apply generic parameter cleanup before RPM filtering
+            # Apply generic parameter cleanup before any other processing
             self._cleanup_critical_parameters()
             
-            # Filter RPM data to handle ECU reporting issues
-            if self.filter_rpm_data:
-                self._filter_rpm_data()
-            
-            # Apply downsampling if requested
+            # Apply downsampling FIRST if requested - this prevents RPM filtering from being overwritten
             if self.downsample_hz is not None:
                 original_count = len(self.data)
                 self.data = self._downsample_data(self.downsample_hz)
                 print(f"Downsampled from {original_count} to {len(self.data)} data points at {self.downsample_hz}Hz")
+            
+            # Filter RPM data AFTER downsampling to handle ECU reporting issues on final dataset
+            if self.filter_rpm_data:
+                self._filter_rpm_data()
                     
             print(f"Loaded {len(self.data)} data points from {csv_path}")
             
@@ -498,7 +498,7 @@ class PowerAnalyzer:
     
     def _smooth_rpm_steps(self, power_hp: np.ndarray, torque_lbft: np.ndarray, rpm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Targeted smoothing to eliminate small RPM step artifacts (like 200 RPM increments)
+        Targeted smoothing to eliminate small RPM step artifacts and end-of-run oscillations
         while preserving the overall power curve characteristics
         """
         signal, gaussian_filter1d, savgol_filter = _import_scipy()
@@ -507,36 +507,128 @@ class PowerAnalyzer:
         rpm_diffs = np.diff(rpm)
         median_step = np.median(rpm_diffs[rpm_diffs > 0])
         
-        # If we have regular steps (like 100-300 RPM), apply targeted smoothing
-        if 50 < median_step < 500:  # Reasonable RPM step range
+        # Check for end-of-run oscillations (impossible zigzag patterns)
+        power_changes = np.abs(np.diff(power_hp))
+        end_third = len(power_hp) // 3
+        end_section_changes = power_changes[-end_third:] if end_third > 5 else power_changes
+        
+        # Detect if end section has excessive oscillations
+        oscillation_threshold = np.std(power_changes) * 2
+        end_oscillations = np.sum(end_section_changes > oscillation_threshold)
+        has_end_oscillations = end_oscillations > len(end_section_changes) * 0.3
+        
+        if has_end_oscillations:
+            print(f"Detected end-of-run oscillations ({end_oscillations} spikes in final third) - applying progressive smoothing")
+        
+        # Apply different strategies based on what we detected
+        if 50 < median_step < 500:  # Regular RPM steps
             print(f"Detected RPM steps of ~{median_step:.0f} RPM - applying targeted smoothing")
-            
-            # Use a small window that spans ~2-3 RPM steps
             window_size = max(3, min(7, int(len(power_hp) / 20)))
             if window_size % 2 == 0:
                 window_size += 1
             
             try:
-                # Light Savitzky-Golay filtering to smooth steps but preserve curve shape
                 smoothed_power = savgol_filter(power_hp, window_size, min(2, window_size-1))
                 smoothed_torque = savgol_filter(torque_lbft, window_size, min(2, window_size-1))
                 print(f"Applied light SavGol smoothing: window={window_size}")
-                
             except (ValueError, np.linalg.LinAlgError):
-                # Fallback to very light Gaussian
                 sigma = 1.0
                 smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
                 smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
                 print(f"Applied light Gaussian smoothing: σ={sigma}")
                 
+        elif has_end_oscillations:
+            # Progressive smoothing - light in middle, heavier at ends
+            print("Applying progressive smoothing to eliminate end oscillations")
+            smoothed_power = power_hp.copy()
+            smoothed_torque = torque_lbft.copy()
+            
+            # Apply heavier smoothing to the problematic end section
+            if end_third > 5:
+                end_window = min(9, end_third // 2)
+                if end_window % 2 == 0:
+                    end_window += 1
+                
+                try:
+                    smoothed_power[-end_third:] = savgol_filter(power_hp[-end_third:], end_window, 2)
+                    smoothed_torque[-end_third:] = savgol_filter(torque_lbft[-end_third:], end_window, 2)
+                    print(f"Applied progressive smoothing: end section window={end_window}")
+                except (ValueError, np.linalg.LinAlgError):
+                    sigma = 2.0
+                    smoothed_power[-end_third:] = gaussian_filter1d(power_hp[-end_third:], sigma=sigma)
+                    smoothed_torque[-end_third:] = gaussian_filter1d(torque_lbft[-end_third:], sigma=sigma)
+                    print(f"Applied progressive Gaussian smoothing: end σ={sigma}")
         else:
-            # No regular steps detected, minimal smoothing
-            print(f"No regular RPM steps detected (median: {median_step:.0f}) - minimal smoothing")
+            # No major issues detected, minimal smoothing
+            print(f"No major artifacts detected (median RPM step: {median_step:.0f}) - minimal smoothing")
             sigma = 0.5
             smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
             smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
         
         return smoothed_power, smoothed_torque
+    
+    def _apply_physics_aware_smoothing(self, power_hp: np.ndarray, torque_lbft: np.ndarray, 
+                                     rpm_smoothed: np.ndarray, rpm_original: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Apply physics-aware smoothing that eliminates impossible sharp angles in power curves
+        while respecting the fundamental relationship between RPM and power output
+        """
+        signal, gaussian_filter1d, savgol_filter = _import_scipy()
+        
+        # Check if this is downsampled high-frequency data
+        was_downsampled = hasattr(self, 'downsample_hz') and self.downsample_hz is not None
+        
+        if was_downsampled:
+            # For downsampled high-frequency data, apply aggressive smoothing to eliminate artifacts
+            # These datasets tend to have calculation artifacts that create unrealistic sharp angles
+            
+            # First, apply strong smoothing to eliminate sharp peaks/valleys
+            sigma_aggressive = max(3.0, len(power_hp) / 30.0)
+            power_heavily_smoothed = gaussian_filter1d(power_hp, sigma=sigma_aggressive)
+            torque_heavily_smoothed = gaussian_filter1d(torque_lbft, sigma=sigma_aggressive)
+            
+            print(f"Physics-aware smoothing: aggressive σ={sigma_aggressive:.2f} for downsampled data")
+            
+            # Apply monotonicity constraint: power shouldn't increase dramatically during RPM plateaus
+            rpm_changes = np.diff(rpm_smoothed)
+            power_changes = np.diff(power_heavily_smoothed)
+            
+            # Find sections where RPM is nearly flat but power jumps
+            rpm_plateau_mask = np.abs(rpm_changes) < 10  # RPM change < 10
+            power_jump_mask = power_changes > 5  # Power increase > 5 HP
+            violations = rpm_plateau_mask & power_jump_mask
+            
+            if np.sum(violations) > 0:
+                print(f"Applying monotonicity fixes to {np.sum(violations)} power plateau violations")
+                
+                # Smooth out violations by interpolating between non-violating points
+                corrected_power = power_heavily_smoothed.copy()
+                for i, is_violation in enumerate(violations):
+                    if is_violation:
+                        # Use trend-based interpolation instead of sharp jump
+                        if i > 0 and i < len(corrected_power) - 2:
+                            trend = (corrected_power[i+2] - corrected_power[i-1]) / 3
+                            corrected_power[i+1] = corrected_power[i] + trend
+                
+                power_heavily_smoothed = corrected_power
+            
+            # Final light smoothing to ensure curves are completely smooth
+            final_sigma = 1.0
+            final_power = gaussian_filter1d(power_heavily_smoothed, sigma=final_sigma)
+            final_torque = gaussian_filter1d(torque_heavily_smoothed, sigma=final_sigma)
+            
+            print(f"Applied final smoothing: σ={final_sigma}")
+            
+        else:
+            # For normal frequency data, use the existing targeted smoothing approach
+            final_power, final_torque = self._smooth_rpm_steps(power_hp, torque_lbft, rpm_original)
+        
+        # Ensure HP-Torque relationship is maintained after smoothing
+        if self.apply_hp_torque_correction:
+            # Recalculate power from smoothed torque to maintain 5252 RPM crossover
+            final_power = (final_torque * rpm_smoothed) / 5252
+        
+        return final_power, final_torque
     
     def _downsample_data(self, target_hz: float):
         """
@@ -796,31 +888,45 @@ class PowerAnalyzer:
         # Check if this is downsampled high-frequency data
         was_downsampled = hasattr(self, 'downsample_hz') and self.downsample_hz is not None
         
-        # For high-frequency data or downsampled data, use more robust differentiation
-        if time_step < 0.01 or was_downsampled:  # Less than 10ms between samples OR was downsampled
-            if debug_mode:
-                print(f"High-frequency/downsampled data detected (dt={time_step:.4f}s), using robust differentiation")
-            
-            # Pre-smooth vehicle speed for high-frequency data to reduce noise amplification
-            if len(vehicle_speed_ms) > 5:
-                # Enhanced pre-smoothing for downsampled high-frequency data
-                if was_downsampled:
-                    # Light smoothing for downsampled data - just remove micro-artifacts
-                    pre_smooth_sigma = max(0.5, 1.0 * time_step / 0.001)
-                    print(f"Light pre-smoothing for downsampled data: σ={pre_smooth_sigma:.2f}")
-                else:
-                    # Apply light pre-smoothing proportional to data frequency
-                    pre_smooth_sigma = max(0.5, 3.0 * time_step / 0.001)  # Scale with frequency
-                
-                vehicle_speed_smoothed = gaussian_filter1d(vehicle_speed_ms, sigma=pre_smooth_sigma)
-                if debug_mode:
-                    print(f"Pre-smoothing vehicle speed with sigma={pre_smooth_sigma:.2f}")
-                    print(f"Speed smoothing reduced variation by {(np.std(vehicle_speed_ms) - np.std(vehicle_speed_smoothed)) / np.std(vehicle_speed_ms) * 100:.1f}%")
+        # CRITICAL: Pre-smooth RPM data BEFORE calculating vehicle speed to prevent acceleration amplification
+        # Even after downsampling and cleanup, micro-variations in RPM cause massive power oscillations
+        if len(rpm) > 5:
+            if was_downsampled:
+                # For downsampled high-frequency data, apply aggressive RPM smoothing
+                # The stair-step artifacts still cause acceleration spikes even after downsampling
+                rpm_smooth_sigma = max(2.0, len(rpm) / 50.0)  # Scale with data length
+                print(f"Aggressive RPM pre-smoothing for downsampled data: σ={rpm_smooth_sigma:.2f}")
+            elif time_step < 0.01:
+                # For high-frequency data, moderate RPM smoothing
+                rpm_smooth_sigma = max(1.5, len(rpm) / 30.0)
+                print(f"Moderate RPM pre-smoothing for high-frequency data: σ={rpm_smooth_sigma:.2f}")
             else:
-                vehicle_speed_smoothed = vehicle_speed_ms
+                # For normal frequency data, light RPM smoothing
+                rpm_smooth_sigma = max(1.0, len(rpm) / 40.0)
+                print(f"Light RPM pre-smoothing: σ={rpm_smooth_sigma:.2f}")
             
-            # Use central difference on smoothed data
-            acceleration = np.gradient(vehicle_speed_smoothed, time_step)
+            # Apply RPM smoothing before any speed calculations
+            rpm_smoothed = gaussian_filter1d(rpm.astype(float), sigma=rpm_smooth_sigma)
+            
+            if debug_mode:
+                rpm_variation_reduction = (np.std(np.diff(rpm)) - np.std(np.diff(rpm_smoothed))) / np.std(np.diff(rpm)) * 100
+                print(f"RPM smoothing reduced variation by {rpm_variation_reduction:.1f}%")
+                print(f"Original RPM std: {np.std(rpm):.1f}, Smoothed RPM std: {np.std(rpm_smoothed):.1f}")
+        else:
+            rpm_smoothed = rpm
+        
+        # Recalculate wheel RPM and vehicle speed using smoothed RPM
+        wheel_rpm = rpm_smoothed / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
+        wheel_speed_rad_per_sec = wheel_rpm * 2 * np.pi / 60
+        vehicle_speed_ms = wheel_speed_rad_per_sec * tire_radius_m
+        
+        # Calculate acceleration using the now-smoothed vehicle speed
+        if time_step < 0.01 or was_downsampled:
+            if debug_mode:
+                print(f"Using robust differentiation (dt={time_step:.4f}s)")
+            
+            # For high-frequency or downsampled data, use central difference
+            acceleration = np.gradient(vehicle_speed_ms, time_step)
         else:
             # For normal frequency data, use standard gradient
             acceleration = np.gradient(vehicle_speed_ms, time_step)
@@ -890,10 +996,10 @@ class PowerAnalyzer:
         else:
             corrected_power_hp = power_hp
         
-        # Apply advanced smoothing to final power and torque curves
-        if len(corrected_power_hp) > 5 and self.smoothing_factor > 0:
-            corrected_power_hp, torque_lbft = self._apply_dyno_style_smoothing(
-                corrected_power_hp, torque_lbft, run_data['Engine Speed'].values
+        # Apply physics-aware smoothing to eliminate impossible sharp angles
+        if len(corrected_power_hp) > 5:
+            corrected_power_hp, torque_lbft = self._apply_physics_aware_smoothing(
+                corrected_power_hp, torque_lbft, rpm_smoothed, run_data['Engine Speed'].values
             )
         
         return corrected_power_hp, torque_lbft
