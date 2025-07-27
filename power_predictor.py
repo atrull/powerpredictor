@@ -998,10 +998,9 @@ class PowerAnalyzer:
             smoothed_power = gaussian_filter1d(power_hp, sigma=sigma)
             smoothed_torque = gaussian_filter1d(torque_lbft, sigma=sigma)
         
-        # Ensure HP-Torque relationship is maintained after smoothing
-        if self.apply_hp_torque_correction:
-            # Recalculate power from smoothed torque to maintain HP-Torque crossover
-            smoothed_power = (smoothed_torque * rpm) / AnalysisConstants.HP_TORQUE_CROSSOVER_RPM
+        # Note: HP-Torque relationship correction removed here
+        # The physics-based calculations should naturally cross at 5252 RPM
+        # when both power and torque are calculated correctly from vehicle dynamics
         
         return smoothed_power, smoothed_torque
     
@@ -1395,7 +1394,9 @@ class PowerAnalyzer:
         torque_lbft = crank_torque_nm * AnalysisConstants.NM_TO_LBFT  # Convert to lb-ft
         
         # Apply configurable drivetrain efficiency (transmission and drivetrain losses)
+        # Both power and torque must be corrected by the same efficiency for HP-Torque relationship to hold
         power_hp = power_hp / self.drivetrain_efficiency
+        # Note: Torque efficiency correction will be applied after smoothing to maintain calculation consistency
         
         # For downsampled data, smooth power and torque INDEPENDENTLY to eliminate kinks
         # Then optionally apply HP-Torque correction to the final smoothed curves
@@ -1411,18 +1412,21 @@ class PowerAnalyzer:
                 artifact_smoothed_power, artifact_smoothed_torque, rpm_smoothed, run_data['Engine Speed'].values
             )
             
-            # OPTIONALLY apply HP-Torque relationship correction to final smoothed curves
+            # Apply drivetrain efficiency to torque to match power correction
+            # This ensures both power and torque are at the same reference point (crankshaft)
+            corrected_torque_lbft = smoothed_torque_lbft / self.drivetrain_efficiency
+            
+            # Use the physics-based calculations directly - they should naturally cross at 5252 RPM
+            # The HP = (Torque × RPM) / 5252 relationship is fundamental to rotational mechanics
+            # and emerges naturally when both values are corrected by the same efficiency factor
+            final_power_hp, final_torque_lbft = smoothed_power_hp, corrected_torque_lbft
+            
             if self.apply_hp_torque_correction:
-                # Average the independently smoothed power with torque-derived power for balance
-                torque_derived_power = (smoothed_torque_lbft * rpm_smoothed) / AnalysisConstants.HP_TORQUE_CROSSOVER_RPM
-                # Use weighted average: 70% physics-based power, 30% torque-derived for crossover
-                final_power_hp = 0.7 * smoothed_power_hp + 0.3 * torque_derived_power
-                final_torque_lbft = smoothed_torque_lbft
-                print("Applied blended HP-Torque correction to maintain smoothness")
-            else:
-                final_power_hp, final_torque_lbft = smoothed_power_hp, smoothed_torque_lbft
+                print("Using pure physics-based calculations with consistent efficiency correction for proper 5252 RPM crossover")
         else:
-            final_power_hp, final_torque_lbft = power_hp, torque_lbft
+            # Apply efficiency correction to torque for consistency with power calculation
+            corrected_torque_lbft = torque_lbft / self.drivetrain_efficiency
+            final_power_hp, final_torque_lbft = power_hp, corrected_torque_lbft
         
         return final_power_hp, final_torque_lbft
     
