@@ -483,10 +483,9 @@ class PowerAnalyzer:
         return recommended_freq
 
     def _cleanup_critical_parameters(self):
-        """Apply generic cleanup to critical ECU parameters that commonly show stair-step patterns"""
+        """Apply generic cleanup to Engine Speed only - other parameters can legitimately be static"""
         critical_params = [
-            'Engine Speed', 'TPS (Main)', 'TPS 2(Main)', 'MAP', 
-            'Lambda 1', 'Lambda Avg', 'IAT', 'BAP'
+            'Engine Speed'  # Only clean RPM - other parameters like TPS, MAP, etc. can be static
         ]
         
         cleaned_count = 0
@@ -511,6 +510,55 @@ class PowerAnalyzer:
         
         if cleaned_count > 0:
             print(f"Generic cleanup applied to {cleaned_count} parameters")
+
+    def _remove_rpm_reversion_datapoints(self, run_data) -> 'pd.DataFrame':
+        """
+        Remove data points with static or decreasing RPM during WOT acceleration.
+        
+        During WOT acceleration, RPM should only increase. Any data points that show
+        static or decreasing RPM are ECU reporting artifacts and should be removed entirely.
+        
+        Args:
+            run_data: DataFrame containing the power run data
+            
+        Returns:
+            Cleaned DataFrame with reversion data points removed
+        """
+        pd = _import_pandas()
+        
+        # Make a copy to work with
+        cleaned_data = run_data.copy()
+        
+        rpm_col = 'Engine Speed'
+        time_col = 'Section Time'
+        
+        if rpm_col not in cleaned_data.columns or time_col not in cleaned_data.columns:
+            return cleaned_data
+        
+        # Calculate overall RPM trend to confirm this is acceleration
+        time_span = cleaned_data[time_col].iloc[-1] - cleaned_data[time_col].iloc[0]
+        rpm_span = cleaned_data[rpm_col].iloc[-1] - cleaned_data[rpm_col].iloc[0]
+        overall_rpm_rate = rpm_span / time_span if time_span > 0 else 0
+        
+        if overall_rpm_rate > 50:  # This is clearly an acceleration phase
+            # Identify indices to remove (RPM reversions)
+            indices_to_remove = []
+            
+            for i in range(1, len(cleaned_data)):
+                current_rpm = cleaned_data[rpm_col].iloc[i]
+                prev_rpm = cleaned_data[rpm_col].iloc[i-1]
+                
+                # Remove data points where RPM is static OR decreasing during WOT acceleration
+                # Both indicate ECU artifacts since RPM should only increase during acceleration
+                if current_rpm <= prev_rpm + 1:  # Static or decreasing (allow 1 RPM tolerance for noise)
+                    indices_to_remove.append(i)
+            
+            if indices_to_remove:
+                print(f"Removing {len(indices_to_remove)} RPM reversion data points during WOT acceleration")
+                # Remove the problematic indices
+                cleaned_data = cleaned_data.drop(cleaned_data.index[indices_to_remove]).reset_index(drop=True)
+        
+        return cleaned_data
 
     def _apply_monotonicity_constraint(self, rpm_values: np.ndarray, time_values: np.ndarray) -> np.ndarray:
         """
@@ -1134,6 +1182,10 @@ class PowerAnalyzer:
         Returns:
             Tuple of (power_hp, torque_lbft) arrays
         """
+        
+        # FIRST: Remove RPM reversion data points before any processing
+        # This eliminates ECU step artifacts at the source
+        run_data = self._remove_rpm_reversion_datapoints(run_data)
         # Calculate vehicle acceleration from RPM change and gearing
         rpm = run_data['Engine Speed'].values
         time_data = run_data['Section Time'].values
@@ -1146,12 +1198,12 @@ class PowerAnalyzer:
             print(f"RPM differences: {np.diff(rpm[:10])}")
             print(f"Time steps: {np.diff(time_data[:10])}")
         
-        # CRITICAL FIX: Ensure RPM is monotonic BEFORE any calculations
-        # This prevents backwards torque lines and power curve artifacts
+        # Since we removed reversion data points, ensure remaining data is monotonic
+        # This prevents any remaining backwards torque lines and power curve artifacts
         rpm_monotonic, rpm_fixes = self._enforce_rpm_monotonicity(rpm)
         
         if rpm_fixes > 0:
-            print(f"Pre-calculation monotonicity fix: corrected {rpm_fixes} RPM reversals")
+            print(f"Post-cleaning monotonicity fix: corrected {rpm_fixes} remaining RPM issues")
         
         # Calculate wheel RPM from monotonic engine RPM
         wheel_rpm = rpm_monotonic / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
@@ -1223,9 +1275,14 @@ class PowerAnalyzer:
             # Apply RPM smoothing to the already monotonic RPM
             rpm_smoothed = gaussian_filter1d(rpm_monotonic.astype(float), sigma=rpm_smooth_sigma)
             
-            # CRITICAL: Enforce monotonicity to eliminate backwards torque lines
+            # CRITICAL: Enforce strict monotonicity to eliminate backwards torque lines
             # Even after smoothing, ensure RPM always increases for proper power calculations
-            rpm_smoothed, post_smooth_fixes = self._enforce_rpm_monotonicity(rpm_smoothed, min_increment=1.0)
+            # Use strict enforcement since we're in WOT acceleration
+            for i in range(1, len(rpm_smoothed)):
+                if rpm_smoothed[i] < rpm_smoothed[i-1]:
+                    rpm_smoothed[i] = rpm_smoothed[i-1] + 0.5  # Force small increase
+            
+            post_smooth_fixes = 0  # Track fixes for reporting
             
             if post_smooth_fixes > 0:
                 print(f"Post-smoothing monotonicity check: {post_smooth_fixes} additional violations fixed")
@@ -1444,7 +1501,17 @@ class PowerAnalyzer:
                 
             run_data = self.data.iloc[start_idx:end_idx+1].copy()
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
-            rpm = run_data['Engine Speed'].values
+            
+            # After calculate_power_torque, the run_data may have been cleaned (RPM reversions removed)
+            # So we need to get the cleaned data dimensions
+            cleaned_run_data = self._remove_rpm_reversion_datapoints(run_data)
+            rpm = cleaned_run_data['Engine Speed'].values
+            
+            # Ensure all arrays have the same length after cleaning
+            min_length = min(len(power_hp), len(torque_lbft), len(rpm))
+            power_hp = power_hp[:min_length]
+            torque_lbft = torque_lbft[:min_length] 
+            rpm = rpm[:min_length]
             
             # Filter out unrealistic values
             valid_mask = (power_hp > 0) & (power_hp < AnalysisConstants.MAX_REALISTIC_POWER) & (torque_lbft > 0) & (torque_lbft < AnalysisConstants.MAX_REALISTIC_TORQUE)
@@ -1663,15 +1730,26 @@ class PowerAnalyzer:
                 
             run_data = self.data.iloc[start_idx:end_idx+1].copy()
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
-            rpm = run_data['Engine Speed'].values
-            time_values = run_data['Section Time'].values
+            
+            # After calculate_power_torque, the run_data may have been cleaned (RPM reversions removed)
+            # So we need to get the cleaned data dimensions
+            cleaned_run_data = self._remove_rpm_reversion_datapoints(run_data)
+            rpm = cleaned_run_data['Engine Speed'].values
+            time_values = cleaned_run_data['Section Time'].values
+            
+            # Ensure all arrays have the same length after cleaning
+            min_length = min(len(power_hp), len(torque_lbft), len(rpm), len(time_values))
+            power_hp = power_hp[:min_length]
+            torque_lbft = torque_lbft[:min_length] 
+            rpm = rpm[:min_length]
+            time_values = time_values[:min_length]
             
             # Filter out unrealistic values
             valid_mask = (power_hp > 0) & (power_hp < AnalysisConstants.MAX_REALISTIC_POWER) & (torque_lbft > 0) & (torque_lbft < AnalysisConstants.MAX_REALISTIC_TORQUE)
             
             if np.any(valid_mask):
                 for j in range(len(rpm)):
-                    if valid_mask[j]:
+                    if j < len(valid_mask) and valid_mask[j]:
                         all_data.append({
                             'rpm': rpm[j],
                             'time': time_values[j],
@@ -1703,9 +1781,15 @@ class PowerAnalyzer:
                 "-" * 75
             ])
             
+            used_data_indices = set()  # Track which data points we've already used
+            
             while current_time <= max_time:
-                # Find the closest data point to this time
-                closest_data = min(all_data, key=lambda x: abs(x['time'] - current_time))
+                # Find the closest data point to this time that hasn't been used yet
+                available_data = [(i, d) for i, d in enumerate(all_data) if i not in used_data_indices]
+                if not available_data:
+                    break
+                    
+                closest_idx, closest_data = min(available_data, key=lambda x: abs(x[1]['time'] - current_time))
                 time_diff = abs(closest_data['time'] - current_time)
                 
                 # Only output if we have data within reasonable range of target time
@@ -1726,6 +1810,8 @@ class PowerAnalyzer:
                         f"{current_time:>8.3f} | {closest_data['rpm']:>6.0f} | {closest_data['power']:>10.1f} | {closest_data['torque']:>12.1f} | "
                         f"{closest_data['run']:>6} | {notes}"
                     )
+                    
+                    used_data_indices.add(closest_idx)  # Mark this data point as used
                 
                 current_time += time_increment
         else:
@@ -1847,19 +1933,31 @@ class PowerAnalyzer:
             start_idx = run['start_idx']
             end_idx = run['end_idx']
                 
-            run_data = self.data.iloc[start_idx:end_idx+1]
+            run_data = self.data.iloc[start_idx:end_idx+1].copy()
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
+            
+            # After calculate_power_torque, the run_data may have been cleaned (RPM reversions removed)
+            # So we need to get the cleaned data dimensions
+            cleaned_run_data = self._remove_rpm_reversion_datapoints(run_data)
+            
+            # Ensure all arrays have the same length after cleaning
+            min_length = min(len(power_hp), len(torque_lbft), len(cleaned_run_data))
+            power_hp = power_hp[:min_length]
+            torque_lbft = torque_lbft[:min_length] 
             
             valid_mask = (power_hp > 0) & (power_hp < AnalysisConstants.MAX_REALISTIC_POWER) & (torque_lbft > 0) & (torque_lbft < AnalysisConstants.MAX_REALISTIC_TORQUE)
             
             if np.any(valid_mask):
                 max_power = np.max(power_hp[valid_mask])
                 max_torque = np.max(torque_lbft[valid_mask])
-                rpm_at_max_power = run_data['Engine Speed'].values[valid_mask][np.argmax(power_hp[valid_mask])]
-                rpm_at_max_torque = run_data['Engine Speed'].values[valid_mask][np.argmax(torque_lbft[valid_mask])]
+                
+                # Use cleaned run data for RPM values
+                cleaned_rpm = cleaned_run_data['Engine Speed'].values[:min_length]
+                rpm_at_max_power = cleaned_rpm[valid_mask][np.argmax(power_hp[valid_mask])]
+                rpm_at_max_torque = cleaned_rpm[valid_mask][np.argmax(torque_lbft[valid_mask])]
                 
                 # Validate HP-Torque crossover
-                validation = self.validate_hp_torque_crossover(run_data, power_hp[valid_mask], torque_lbft[valid_mask])
+                validation = self.validate_hp_torque_crossover(cleaned_run_data, power_hp[valid_mask], torque_lbft[valid_mask])
                 
                 report.extend([
                     f"Run {i+1}:",
