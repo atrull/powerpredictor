@@ -18,9 +18,11 @@ build-test: build
 
 k20:
 	MPLBACKEND=Agg uv run python power_predictor.py k20_pull.csv --weight 1060 --occupant 130 --displacement 2.0 --out k20.png
+	MPLBACKEND=Agg uv run python power_predictor.py k20_pull2.csv --weight 1060 --occupant 130 --displacement 2.0 --out k20_pull2.png
 
 k20-unfiltered:
 	MPLBACKEND=Agg uv run python power_predictor.py k20_pull.csv --weight 1060 --occupant 130 --displacement 2.0 --no-rpm-filtering --out k20-unfiltered.png
+	MPLBACKEND=Agg uv run python power_predictor.py k20_pull2.csv --weight 1060 --occupant 130 --displacement 2.0 --no-rpm-filtering --out k20_pull2-unfiltered.png
 
 white:
 	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_nbg_run.png
