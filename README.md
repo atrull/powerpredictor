@@ -14,15 +14,15 @@ This tool analyzes CSV logs from ECUs to determine power and torque by analyzing
 
 ## Features
 
-- Filters data for WOT conditions (99-100% throttle) with stable-enough RPM increases
+- Filters data for WOT conditions (96-100% throttle) with stable-enough RPM increases
 - Intelligent gap bridging to handle brief throttle/RPM fluctuations
 - Configurable frame trimming to clean up start/end of power runs
-- Calculates power (HP) and torque (lb-ft) from vehicle dynamics
+- Calculates power (HP) and torque (lb-ft) from vehicle dynamics [parameters]
 - Generates dyno-style graphs showing power and torque vs RPM
 - Dataset coverage visualization showing which parts of the log were analyzed
 - Supports multiple power runs in a single log file
 - Configurable vehicle parameters (weight, gearing, tires, etc.)
-- Advanced data filtering for problematic ECU readings
+- Advanced data filtering for problematic ECU readings [high/mixed frequency]
 
 ## Installation
 
