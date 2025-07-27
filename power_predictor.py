@@ -27,6 +27,34 @@ def _import_scipy():
     from scipy.signal import savgol_filter
     return signal, gaussian_filter1d, savgol_filter
 
+class AnalysisConstants:
+    """Constants used throughout the power analysis"""
+    # Physics constants
+    HP_TORQUE_CROSSOVER_RPM = 5252
+    WATTS_TO_HP = 745.7
+    NM_TO_LBFT = 0.737562
+    RPM_TO_RAD_PER_SEC = 2 * np.pi / 60
+    GRAVITY_MS2 = 9.81
+    AIR_DENSITY_KG_M3 = 1.225
+    
+    # Analysis defaults
+    DEFAULT_THROTTLE_THRESHOLD = 96
+    DEFAULT_MIN_RPM = 2000
+    DEFAULT_MIN_DURATION = 1.0
+    DEFAULT_MIN_RPM_RANGE = 2500
+    DEFAULT_SMOOTHING_FACTOR = 2.5
+    DEFAULT_TRIM_FRAMES = 20
+    DEFAULT_MAX_GAP = 5
+    
+    # Data quality thresholds
+    HIGH_FREQUENCY_THRESHOLD = 200  # Hz
+    STAIR_STEP_RATIO_THRESHOLD = 0.3
+    MAX_RPM_CHANGE_PER_SEC = 2000
+    
+    # Validation limits
+    MAX_REALISTIC_POWER = 1000  # HP
+    MAX_REALISTIC_TORQUE = 1000  # lb-ft
+
 @dataclass
 class VehicleSpecs:
     """Vehicle specifications for power calculations"""
@@ -318,6 +346,27 @@ class PowerAnalyzer:
         
         # Update the main data
         self.data = filtered_data
+    
+    def _enforce_rpm_monotonicity(self, rpm_values: np.ndarray, min_increment: float = 0.1) -> Tuple[np.ndarray, int]:
+        """
+        Ensure RPM values are strictly increasing for proper power calculations
+        
+        Args:
+            rpm_values: Array of RPM values to fix
+            min_increment: Minimum increment to add when fixing reversals
+            
+        Returns:
+            Tuple of (corrected_rpm_values, number_of_fixes_applied)
+        """
+        corrected = rpm_values.copy()
+        fixes = 0
+        
+        for i in range(1, len(corrected)):
+            if corrected[i] <= corrected[i-1]:
+                corrected[i] = corrected[i-1] + min_increment
+                fixes += 1
+        
+        return corrected, fixes
     
     def _apply_generic_parameter_cleanup(self, data, column_name: str, time_column: str = 'Section Time') -> np.ndarray:
         """
@@ -743,8 +792,8 @@ class PowerAnalyzer:
         
         # Ensure HP-Torque relationship is maintained after smoothing
         if self.apply_hp_torque_correction:
-            # Recalculate power from smoothed torque to maintain 5252 RPM crossover
-            smoothed_power = (smoothed_torque * rpm) / 5252
+            # Recalculate power from smoothed torque to maintain HP-Torque crossover
+            smoothed_power = (smoothed_torque * rpm) / AnalysisConstants.HP_TORQUE_CROSSOVER_RPM
         
         return smoothed_power, smoothed_torque
     
@@ -778,7 +827,7 @@ class PowerAnalyzer:
         stable_increase = rpm_diff > -10  # Allow small RPM decreases for downsampled data
         
         # Combine conditions - lower RPM threshold
-        valid_conditions = wot_mask & stable_increase & (self.data['Engine Speed'] > 2000)
+        valid_conditions = wot_mask & stable_increase & (self.data['Engine Speed'] > AnalysisConstants.DEFAULT_MIN_RPM)
         
         # Find continuous runs with gap tolerance to merge close runs
         runs = []
@@ -872,12 +921,7 @@ class PowerAnalyzer:
         
         # CRITICAL FIX: Ensure RPM is monotonic BEFORE any calculations
         # This prevents backwards torque lines and power curve artifacts
-        rpm_monotonic = rpm.copy()
-        rpm_fixes = 0
-        for i in range(1, len(rpm_monotonic)):
-            if rpm_monotonic[i] <= rpm_monotonic[i-1]:
-                rpm_monotonic[i] = rpm_monotonic[i-1] + 0.1  # Tiny increment to maintain monotonicity
-                rpm_fixes += 1
+        rpm_monotonic, rpm_fixes = self._enforce_rpm_monotonicity(rpm)
         
         if rpm_fixes > 0:
             print(f"Pre-calculation monotonicity fix: corrected {rpm_fixes} RPM reversals")
@@ -922,14 +966,10 @@ class PowerAnalyzer:
             
             # CRITICAL: Enforce monotonicity to eliminate backwards torque lines
             # Even after smoothing, ensure RPM always increases for proper power calculations
-            for i in range(1, len(rpm_smoothed)):
-                if rpm_smoothed[i] <= rpm_smoothed[i-1]:
-                    # Force RPM to always increase by at least 1 RPM
-                    rpm_smoothed[i] = rpm_smoothed[i-1] + 1.0
+            rpm_smoothed, post_smooth_fixes = self._enforce_rpm_monotonicity(rpm_smoothed, min_increment=1.0)
             
-            # Count additional violations fixed during smoothing (should be minimal now)
-            smoothing_violations = np.sum(np.diff(rpm_smoothed) <= 0) 
-            print(f"Post-smoothing monotonicity check: {smoothing_violations} additional violations")
+            if post_smooth_fixes > 0:
+                print(f"Post-smoothing monotonicity check: {post_smooth_fixes} additional violations fixed")
             
             if debug_mode:
                 rpm_variation_reduction = (np.std(np.diff(rpm)) - np.std(np.diff(rpm_smoothed))) / np.std(np.diff(rpm)) * 100
@@ -1023,21 +1063,20 @@ class PowerAnalyzer:
         force_n = mass_kg * acceleration
         
         # Add rolling resistance and aerodynamic drag using configurable parameters
-        rolling_resistance_force = mass_kg * 9.81 * self.rolling_resistance
+        rolling_resistance_force = mass_kg * AnalysisConstants.GRAVITY_MS2 * self.rolling_resistance
         # Use the calculated vehicle speed for aerodynamic drag
-        aero_drag = 0.5 * 1.225 * self.drag_coefficient * self.frontal_area * vehicle_speed_ms**2
+        aero_drag = 0.5 * AnalysisConstants.AIR_DENSITY_KG_M3 * self.drag_coefficient * self.frontal_area * vehicle_speed_ms**2
         
         total_force = force_n + rolling_resistance_force + aero_drag
         
         # Calculate power at wheels
         power_watts = total_force * vehicle_speed_ms
-        power_hp = power_watts / 745.7  # Convert to HP
+        power_hp = power_watts / AnalysisConstants.WATTS_TO_HP  # Convert to HP
         
-        # Calculate torque at crankshaft
-        rpm = run_data['Engine Speed'].values
+        # Calculate torque at crankshaft (using smoothed RPM for consistency)
         wheel_torque_nm = (total_force * self.vehicle_specs.tire_circumference_m) / (2 * np.pi)
         crank_torque_nm = wheel_torque_nm / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
-        torque_lbft = crank_torque_nm * 0.737562  # Convert to lb-ft
+        torque_lbft = crank_torque_nm * AnalysisConstants.NM_TO_LBFT  # Convert to lb-ft
         
         # Apply configurable drivetrain efficiency (transmission and drivetrain losses)
         power_hp = power_hp / self.drivetrain_efficiency
@@ -1053,7 +1092,7 @@ class PowerAnalyzer:
             # OPTIONALLY apply HP-Torque relationship correction to final smoothed curves
             if self.apply_hp_torque_correction:
                 # Average the independently smoothed power with torque-derived power for balance
-                torque_derived_power = (smoothed_torque_lbft * rpm_smoothed) / 5252
+                torque_derived_power = (smoothed_torque_lbft * rpm_smoothed) / AnalysisConstants.HP_TORQUE_CROSSOVER_RPM
                 # Use weighted average: 70% physics-based power, 30% torque-derived for crossover
                 final_power_hp = 0.7 * smoothed_power_hp + 0.3 * torque_derived_power
                 final_torque_lbft = smoothed_torque_lbft
@@ -1085,25 +1124,26 @@ class PowerAnalyzer:
         crossover_rpm = rpm[crossover_idx]
         crossover_value = (power_hp[crossover_idx] + torque_lbft[crossover_idx]) / 2
         
-        # Calculate theoretical values at 5252 RPM if in range
+        # Calculate theoretical values at HP-Torque crossover RPM if in range
+        crossover_rpm = AnalysisConstants.HP_TORQUE_CROSSOVER_RPM
         theoretical_crossover = None
-        if min(rpm) <= 5252 <= max(rpm):
-            # Interpolate to find values at exactly 5252 RPM
-            hp_at_5252 = np.interp(5252, rpm, power_hp)
-            torque_at_5252 = np.interp(5252, rpm, torque_lbft)
+        if min(rpm) <= crossover_rpm <= max(rpm):
+            # Interpolate to find values at exactly crossover RPM
+            hp_at_crossover = np.interp(crossover_rpm, rpm, power_hp)
+            torque_at_crossover = np.interp(crossover_rpm, rpm, torque_lbft)
             theoretical_crossover = {
-                'hp_at_5252': hp_at_5252,
-                'torque_at_5252': torque_at_5252,
-                'difference': abs(hp_at_5252 - torque_at_5252),
-                'average_value': (hp_at_5252 + torque_at_5252) / 2
+                'hp_at_crossover': hp_at_crossover,
+                'torque_at_crossover': torque_at_crossover,
+                'difference': abs(hp_at_crossover - torque_at_crossover),
+                'average_value': (hp_at_crossover + torque_at_crossover) / 2
             }
         
         return {
             'actual_crossover_rpm': crossover_rpm,
             'actual_crossover_value': crossover_value,
-            'rpm_error': abs(crossover_rpm - 5252),
-            'theoretical_at_5252': theoretical_crossover,
-            'in_rpm_range': min(rpm) <= 5252 <= max(rpm)
+            'rpm_error': abs(crossover_rpm - AnalysisConstants.HP_TORQUE_CROSSOVER_RPM),
+            'theoretical_at_crossover': theoretical_crossover,
+            'in_rpm_range': min(rpm) <= AnalysisConstants.HP_TORQUE_CROSSOVER_RPM <= max(rpm)
         }
     
     def plot_power_curves(self, save_path: Optional[str] = None, title: Optional[str] = None) -> None:
@@ -1148,7 +1188,7 @@ class PowerAnalyzer:
             rpm = run_data['Engine Speed'].values
             
             # Filter out unrealistic values
-            valid_mask = (power_hp > 0) & (power_hp < 1000) & (torque_lbft > 0) & (torque_lbft < 1000)
+            valid_mask = (power_hp > 0) & (power_hp < AnalysisConstants.MAX_REALISTIC_POWER) & (torque_lbft > 0) & (torque_lbft < AnalysisConstants.MAX_REALISTIC_TORQUE)
             
             if np.any(valid_mask):
                 # Power as solid lines
@@ -1187,9 +1227,10 @@ class PowerAnalyzer:
                     label=f'Avg Torque{label_suffix}')
         
         # Add reference line at 5252 RPM where HP and Torque curves should cross
-        if all_rpm and min(all_rpm) < 5252 < max(all_rpm):
-            ax1.axvline(x=5252, color='gray', linestyle='--', alpha=0.5, linewidth=1)
-            ax1.text(5252, ax1.get_ylim()[1] * 0.95, '5252 RPM\n(HP=Torque)', 
+        crossover_rpm = AnalysisConstants.HP_TORQUE_CROSSOVER_RPM
+        if all_rpm and min(all_rpm) < crossover_rpm < max(all_rpm):
+            ax1.axvline(x=crossover_rpm, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+            ax1.text(crossover_rpm, ax1.get_ylim()[1] * 0.95, f'{crossover_rpm} RPM\n(HP=Torque)', 
                     ha='center', va='top', fontsize=9, color='gray',
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
         
@@ -1374,7 +1415,7 @@ class PowerAnalyzer:
             rpm = run_data['Engine Speed'].values
             
             # Filter out unrealistic values
-            valid_mask = (power_hp > 0) & (power_hp < 1000) & (torque_lbft > 0) & (torque_lbft < 1000)
+            valid_mask = (power_hp > 0) & (power_hp < AnalysisConstants.MAX_REALISTIC_POWER) & (torque_lbft > 0) & (torque_lbft < AnalysisConstants.MAX_REALISTIC_TORQUE)
             
             if np.any(valid_mask):
                 for j in range(len(rpm)):
@@ -1421,8 +1462,8 @@ class PowerAnalyzer:
                 if rpm_diff > rpm_increment * 0.3:
                     notes = f"±{rpm_diff:.0f} RPM"
                 
-                # Check for HP=Torque crossover at 5252 RPM
-                if abs(current_rpm - 5252) <= rpm_increment / 2:
+                # Check for HP=Torque crossover at crossover RPM
+                if abs(current_rpm - AnalysisConstants.HP_TORQUE_CROSSOVER_RPM) <= rpm_increment / 2:
                     hp_torque_diff = abs(closest_data['power'] - closest_data['torque'])
                     if hp_torque_diff < 5:
                         notes += " HP≈Torque" if notes else "HP≈Torque"
@@ -1517,7 +1558,7 @@ class PowerAnalyzer:
             run_data = self.data.iloc[start_idx:end_idx+1]
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
             
-            valid_mask = (power_hp > 0) & (power_hp < 1000) & (torque_lbft > 0) & (torque_lbft < 1000)
+            valid_mask = (power_hp > 0) & (power_hp < AnalysisConstants.MAX_REALISTIC_POWER) & (torque_lbft > 0) & (torque_lbft < AnalysisConstants.MAX_REALISTIC_TORQUE)
             
             if np.any(valid_mask):
                 max_power = np.max(power_hp[valid_mask])
@@ -1540,10 +1581,10 @@ class PowerAnalyzer:
                 if validation['in_rpm_range']:
                     report.extend([
                         f"  HP=Torque Crossover: {validation['actual_crossover_rpm']:.0f} RPM (error: {validation['rpm_error']:.0f} RPM)",
-                        f"  Values at 5252 RPM: HP={validation['theoretical_at_5252']['hp_at_5252']:.1f}, Torque={validation['theoretical_at_5252']['torque_at_5252']:.1f} (diff: {validation['theoretical_at_5252']['difference']:.1f})"
+                        f"  Values at {AnalysisConstants.HP_TORQUE_CROSSOVER_RPM} RPM: HP={validation['theoretical_at_crossover']['hp_at_crossover']:.1f}, Torque={validation['theoretical_at_crossover']['torque_at_crossover']:.1f} (diff: {validation['theoretical_at_crossover']['difference']:.1f})"
                     ])
                 else:
-                    report.append(f"  HP=Torque Crossover: Not in RPM range (5252 RPM outside {run['start_rpm']:.0f}-{run['end_rpm']:.0f})")
+                    report.append(f"  HP=Torque Crossover: Not in RPM range ({AnalysisConstants.HP_TORQUE_CROSSOVER_RPM} RPM outside {run['start_rpm']:.0f}-{run['end_rpm']:.0f})")
                 
                 # Add environmental conditions for this run
                 start_bap = run_data['BAP'].iloc[0] if 'BAP' in run_data.columns else None
@@ -1626,25 +1667,25 @@ Examples:
                        help='Aerodynamic drag coefficient (default: 0.35)')
     parser.add_argument('--frontal-area', type=float, default=2.5, 
                        help='Vehicle frontal area in m² (default: 2.5)')
-    parser.add_argument('--smoothing-factor', type=float, default=2.5, 
+    parser.add_argument('--smoothing-factor', type=float, default=AnalysisConstants.DEFAULT_SMOOTHING_FACTOR, 
                        help='Data smoothing factor - 0 disables, higher values = more smoothing (default: 2.5)')
     parser.add_argument('--no-hp-torque-correction', action='store_true', 
                        help='Disable HP-Torque relationship correction (HP = Torque * RPM / 5252)')
     parser.add_argument('--no-rpm-filtering', action='store_true', 
                        help='Disable RPM data filtering (keeps duplicate/bad ECU readings)')
-    parser.add_argument('--trim-frames', type=int, default=20, 
+    parser.add_argument('--trim-frames', type=int, default=AnalysisConstants.DEFAULT_TRIM_FRAMES, 
                        help='Number of frames to trim from start/end of each run for cleaner data (default: 20)')
-    parser.add_argument('--max-gap', type=int, default=5, 
+    parser.add_argument('--max-gap', type=int, default=AnalysisConstants.DEFAULT_MAX_GAP, 
                        help='Maximum consecutive invalid samples allowed before ending a power run (default: 5)')
     parser.add_argument('--downsample-hz', type=float, default=None, 
                        help='Downsample data to specified frequency in Hz (e.g., 50 for high-frequency ECU logs)')
     
     # Analysis parameters
-    parser.add_argument('--min-duration', type=float, default=1.0, 
+    parser.add_argument('--min-duration', type=float, default=AnalysisConstants.DEFAULT_MIN_DURATION, 
                        help='Minimum power run duration in seconds (default: 1.0)')
-    parser.add_argument('--min-rpm-range', type=float, default=2500, 
+    parser.add_argument('--min-rpm-range', type=float, default=AnalysisConstants.DEFAULT_MIN_RPM_RANGE, 
                        help='Minimum RPM range for valid run (default: 2500)')
-    parser.add_argument('--throttle-threshold', type=float, default=96, 
+    parser.add_argument('--throttle-threshold', type=float, default=AnalysisConstants.DEFAULT_THROTTLE_THRESHOLD, 
                        help='Minimum throttle %% for WOT detection (default: 96)')
     
     # Output options
