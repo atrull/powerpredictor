@@ -27,11 +27,11 @@ white:
 	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_pull2.png
 
 white-unfiltered:
-	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_nbg_run-unfiltered.png --no-rpm-filtering 
-	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_pull2.png --no-rpm-filtering 
+	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_nbg_run-unfiltered.png --no-rpm-filtering
+	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_pull2-unfiltered.png --no-rpm-filtering
 
 black:
 	# should be 4th gear 1.0 ratio but that predicts too much power
 	MPLBACKEND=Agg uv run python power_predictor.py black.csv --weight 1022 --occupant 85 --gear-ratio 1.33 --final-drive 4.3 --displacement 1.6 --smoothing-factor 5 --max-gap 15 --out black.png
 
-all: k20 k20-unfiltered white white-unfiltered black
+all: k20 white black

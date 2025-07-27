@@ -41,19 +41,19 @@ pip install pandas numpy matplotlib
 
 Basic usage with default Honda EP3 Type R specifications:
 ```bash
-python power_analyzer.py "your_log.csv"
+python power_predictor.py "your_log.csv"
 ```
 
 With custom vehicle specifications:
 ```bash
-python power_analyzer.py "your_log.csv" \
+python power_predictor.py "your_log.csv" \
   --weight 1200 \
   --occupant 100 \
   --final-drive 4.3 \
   --gear-ratio 1.000 \
   --displacement 2.0 \
   --cylinders 4 \
-  --output power_curves.png
+  --out power_curves.png
 ```
 
 ### Command Line Options
@@ -76,24 +76,28 @@ python power_analyzer.py "your_log.csv" \
 
 #### Vehicle Dynamics
 - `--rolling-resistance`: Rolling resistance coefficient (default: 0.015)
-- `--drag-coefficient`: Aerodynamic drag coefficient (default: 0.3)
+- `--drag-coefficient`: Aerodynamic drag coefficient (default: 0.35)
 - `--frontal-area`: Vehicle frontal area in m² (default: 2.5)
 
 #### Data Processing
 - `--smoothing-factor`: Data smoothing factor - 0 disables, higher values = more smoothing (default: 2.5)
 - `--trim-frames`: Number of frames to trim from start/end of each run for cleaner data (default: 20)
+- `--max-gap`: Maximum consecutive invalid samples allowed before ending a power run (default: 5)
+- `--downsample-hz`: Downsample data to specified frequency in Hz (e.g., 50 for high-frequency ECU logs)
 - `--no-hp-torque-correction`: Disable HP-Torque relationship correction (HP = Torque * RPM / 5252)
 - `--no-rpm-filtering`: Disable RPM data filtering (keeps duplicate/bad ECU readings)
 
 #### Analysis Parameters
 - `--min-duration`: Minimum power run duration in seconds (default: 1.0)
-- `--min-rpm-range`: Minimum RPM range for valid run (default: 500)
-- `--throttle-threshold`: Minimum throttle % for WOT detection (default: 99.5)
+- `--min-rpm-range`: Minimum RPM range for valid run (default: 2500)
+- `--throttle-threshold`: Minimum throttle % for WOT detection (default: 96)
 
 #### Output Options
-- `--output`: Output file for the graph (optional)
+- `--out`: Output file for the graph (optional)
 - `--title`: Custom title for the plot
 - `--no-plot`: Skip generating plot (text report only)
+- `--debug`: Enable debug mode - output tabular data instead of graph
+- `--debug-rpm-increment`: RPM increment for debug mode output (default: 250)
 
 ## CSV Format Requirements
 
