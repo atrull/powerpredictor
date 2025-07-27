@@ -1,15 +1,26 @@
 # Power Predictor
 
-A tool for analyzing ECU log data to calculate power and torque curves, similar to a dynamometer. Inspired by Virtual Dyno but lacking all the testing, calibration and so on that that has undergone.
+A tool for analyzing ECU log data to calculate power and torque curves, similar to a dynamometer. Inspired by Virtual Dyno but lacking all the testing, calibration and so on that that has (we think) undergone.
 
 ## Overview
 
 This tool analyzes CSV logs from ECUs to determine power and torque by analyzing vehicle dynamics during wide-open-throttle (WOT) conditions. It uses acceleration data, vehicle weight, gearing, and tire specifications to calculate engine power and torque.
 
+It is best used for comparing runs between tunes of the same vehicle on the same day, or for getting a 'picture' without needing to hire a dyno.
+
 ![alt text](test-unfiltered.png "Unfiltered Screenshot")
+
+## How it ECU Logging works imperfectly
+
+ECUs log as a secondary or tertiary downstream function for diagnosis, they do not log as a primary concern. This means that reported RPM is not necessarily realtime. Typically an ECU has dedicated physical hardware for firing injectors and spark plug coils and a miriad other things related to power train, emissions and safety. 
+
+As such, the log at best is a blurry view of what the ECU was doing and cannot accurately show the time of an event, but rather a picture of the state of the engine in broad terms.
+
+Using this broad data and with some load/wheel calculations, we can get an idea of the engine performance. The idea is that the logged ramp of RPM can be used to back-calculate the power generated - i.e. simply: for acceleration to continue at X rate with Y (load * wheel size * drive ratio * other parameters) it takes Z torque. Torque values are then converted to HP using standard formula.
 
 ## Limitations
 
+- Inputs are only as good as outputs, setting up a dyno is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, etc. You must gather a lot of accurate data to use this tool.
 - Only works with G4X [the developer only has G4X ECUs] (but could be extended to others easily.)
 
 ## Features
