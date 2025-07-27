@@ -613,6 +613,186 @@ class PowerAnalyzer:
         
         return smoothed_power, smoothed_torque
     
+    def _detect_and_smooth_rpm_step_artifacts(self, power_hp: np.ndarray, torque_lbft: np.ndarray, 
+                                             rpm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Detect and smooth step artifacts caused by ECU RPM 'step and jump' patterns.
+        Uses angle analysis to detect sudden changes in power/torque slope that don't match
+        the overall trend, then smooths backwards across the step.
+        """
+        if len(power_hp) < 10:
+            return power_hp, torque_lbft
+            
+        power_smoothed = power_hp.copy()
+        torque_smoothed = torque_lbft.copy()
+        
+        # Calculate the local slope (angle) for power and torque curves
+        rpm_diffs = np.diff(rpm)
+        power_diffs = np.diff(power_hp)
+        torque_diffs = np.diff(torque_lbft)
+        
+        # Calculate slopes (power/rpm and torque/rpm) 
+        power_slopes = np.divide(power_diffs, rpm_diffs, out=np.zeros_like(power_diffs), where=rpm_diffs!=0)
+        torque_slopes = np.divide(torque_diffs, rpm_diffs, out=np.zeros_like(torque_diffs), where=rpm_diffs!=0)
+        
+        # Use rolling window to establish the expected trend
+        window_size = max(5, len(power_hp) // 20)
+        if window_size > 15:
+            window_size = 15
+            
+        # Calculate expected slopes using rolling median (more robust to outliers)
+        expected_power_slopes = np.zeros_like(power_slopes)
+        expected_torque_slopes = np.zeros_like(torque_slopes)
+        
+        for i in range(len(power_slopes)):
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(len(power_slopes), i + window_size // 2 + 1)
+            
+            window_power_slopes = power_slopes[start_idx:end_idx]
+            window_torque_slopes = torque_slopes[start_idx:end_idx]
+            
+            # Use median to get expected trend, ignoring extreme outliers
+            expected_power_slopes[i] = np.median(window_power_slopes)
+            expected_torque_slopes[i] = np.median(window_torque_slopes)
+        
+        # Detect step artifacts: slopes that deviate significantly from expected trend
+        power_slope_deviations = np.abs(power_slopes - expected_power_slopes)
+        torque_slope_deviations = np.abs(torque_slopes - expected_torque_slopes)
+        
+        # Calculate dynamic thresholds based on overall slope variation
+        power_slope_threshold = np.std(expected_power_slopes) * 1.5  # 1.5 sigma threshold (very sensitive)
+        torque_slope_threshold = np.std(expected_torque_slopes) * 1.5
+        
+        # Ensure very sensitive thresholds to catch ECU step artifacts
+        power_slope_threshold = max(power_slope_threshold, 0.15)  # Minimum 0.15 HP/RPM deviation (more sensitive)
+        torque_slope_threshold = max(torque_slope_threshold, 0.1)  # Minimum 0.1 lb-ft/RPM deviation (more sensitive)
+        
+        # Find step artifacts
+        power_artifacts = power_slope_deviations > power_slope_threshold
+        torque_artifacts = torque_slope_deviations > torque_slope_threshold
+        
+        # Combine artifacts (if either power or torque shows artifact, treat as step)
+        step_artifacts = power_artifacts | torque_artifacts
+        
+        # Debug: Check for specific known artifacts around 3836 and 4252 RPM
+        debug_rpms = [3836, 4252]
+        for debug_rpm in debug_rpms:
+            closest_idx = np.argmin(np.abs(rpm - debug_rpm))
+            if closest_idx < len(power_slopes):
+                slope_idx = closest_idx if closest_idx < len(power_slopes) else len(power_slopes) - 1
+                power_dev = power_slope_deviations[slope_idx] if slope_idx < len(power_slope_deviations) else 0
+                torque_dev = torque_slope_deviations[slope_idx] if slope_idx < len(torque_slope_deviations) else 0
+                
+                # Additional debug info
+                actual_power_slope = power_slopes[slope_idx] if slope_idx < len(power_slopes) else 0
+                expected_power_slope = expected_power_slopes[slope_idx] if slope_idx < len(expected_power_slopes) else 0
+                actual_torque_slope = torque_slopes[slope_idx] if slope_idx < len(torque_slopes) else 0
+                expected_torque_slope = expected_torque_slopes[slope_idx] if slope_idx < len(expected_torque_slopes) else 0
+                
+                # Show power/torque values around this point
+                start_check = max(0, closest_idx - 2)
+                end_check = min(len(power_hp), closest_idx + 3)
+                power_window = power_hp[start_check:end_check]
+                torque_window = torque_lbft[start_check:end_check]
+                rpm_window = rpm[start_check:end_check]
+                
+                print(f"Debug artifact check at {debug_rpm} RPM (idx {closest_idx}, slope_idx {slope_idx}):")
+                print(f"  Power: actual_slope={actual_power_slope:.3f}, expected_slope={expected_power_slope:.3f}, deviation={power_dev:.3f} (thresh={power_slope_threshold:.3f})")
+                print(f"  Torque: actual_slope={actual_torque_slope:.3f}, expected_slope={expected_torque_slope:.3f}, deviation={torque_dev:.3f} (thresh={torque_slope_threshold:.3f})")
+                print(f"  Power values around {debug_rpm}: {power_window}")
+                print(f"  Torque values around {debug_rpm}: {torque_window}")
+                print(f"  RPM values around {debug_rpm}: {rpm_window}")
+        
+        if np.any(step_artifacts):
+            artifact_indices = np.where(step_artifacts)[0]
+            print(f"Detected {len(artifact_indices)} step artifacts at RPM positions: {rpm[artifact_indices + 1].astype(int)}")
+            print(f"  Power slope threshold: {power_slope_threshold:.3f}, Torque slope threshold: {torque_slope_threshold:.3f}")
+            
+            # Process each artifact
+            for artifact_idx in artifact_indices:
+                # Get the actual data point index (artifact_idx is slope index, so +1 for data point)
+                step_point = artifact_idx + 1
+                
+                # Define smoothing window around the step
+                smooth_start = max(0, step_point - 3)
+                smooth_end = min(len(power_hp), step_point + 4)
+                
+                if smooth_end - smooth_start >= 4:  # Need at least 4 points to smooth
+                    # Get the trend before and after the step
+                    before_start = max(0, smooth_start - 5)
+                    after_end = min(len(power_hp), smooth_end + 5)
+                    
+                    # Calculate trend using points before and after the artifact region
+                    trend_points_power = np.concatenate([
+                        power_hp[before_start:smooth_start],
+                        power_hp[smooth_end:after_end]
+                    ])
+                    trend_points_torque = np.concatenate([
+                        torque_lbft[before_start:smooth_start], 
+                        torque_lbft[smooth_end:after_end]
+                    ])
+                    trend_points_rpm = np.concatenate([
+                        rpm[before_start:smooth_start],
+                        rpm[smooth_end:after_end]
+                    ])
+                    
+                    if len(trend_points_rpm) >= 4:
+                        # Fit linear trend through the surrounding points
+                        try:
+                            power_trend_coeff = np.polyfit(trend_points_rpm, trend_points_power, 1)
+                            torque_trend_coeff = np.polyfit(trend_points_rpm, trend_points_torque, 1)
+                            
+                            # Calculate expected values based on trend
+                            smooth_rpm = rpm[smooth_start:smooth_end]
+                            expected_power = np.polyval(power_trend_coeff, smooth_rpm)
+                            expected_torque = np.polyval(torque_trend_coeff, smooth_rpm)
+                            
+                            # Blend with original values using weights that emphasize the trend
+                            # Give more weight to trend at the step point, less weight at the edges
+                            weights = np.ones(len(smooth_rpm))
+                            step_relative_pos = step_point - smooth_start
+                            if 0 <= step_relative_pos < len(weights):
+                                weights[step_relative_pos] = 0.8  # Heavy smoothing at step point
+                                # Moderate smoothing for adjacent points
+                                if step_relative_pos > 0:
+                                    weights[step_relative_pos - 1] = 0.6
+                                if step_relative_pos < len(weights) - 1:
+                                    weights[step_relative_pos + 1] = 0.6
+                            
+                            # Apply blended smoothing
+                            original_power = power_smoothed[smooth_start:smooth_end]
+                            original_torque = torque_smoothed[smooth_start:smooth_end]
+                            
+                            power_smoothed[smooth_start:smooth_end] = (
+                                weights * expected_power + (1 - weights) * original_power
+                            )
+                            torque_smoothed[smooth_start:smooth_end] = (
+                                weights * expected_torque + (1 - weights) * original_torque
+                            )
+                            
+                            print(f"  Smoothed artifact at {rpm[step_point]:.0f} RPM")
+                            
+                        except np.linalg.LinAlgError:
+                            # Fallback to simple interpolation if polyfit fails
+                            if smooth_start > 0 and smooth_end < len(power_hp):
+                                smooth_rpm = rpm[smooth_start:smooth_end]
+                                start_power, end_power = power_hp[smooth_start-1], power_hp[smooth_end]
+                                start_torque, end_torque = torque_lbft[smooth_start-1], torque_lbft[smooth_end]
+                                start_rpm, end_rpm = rpm[smooth_start-1], rpm[smooth_end]
+                                
+                                interp_power = np.interp(smooth_rpm, [start_rpm, end_rpm], [start_power, end_power])
+                                interp_torque = np.interp(smooth_rpm, [start_rpm, end_rpm], [start_torque, end_torque])
+                                
+                                # Blend interpolated with original (70% interpolated, 30% original)
+                                power_smoothed[smooth_start:smooth_end] = (
+                                    0.7 * interp_power + 0.3 * power_smoothed[smooth_start:smooth_end]
+                                )
+                                torque_smoothed[smooth_start:smooth_end] = (
+                                    0.7 * interp_torque + 0.3 * torque_smoothed[smooth_start:smooth_end]
+                                )
+        
+        return power_smoothed, torque_smoothed
+
     def _apply_physics_aware_smoothing(self, power_hp: np.ndarray, torque_lbft: np.ndarray, 
                                      rpm_smoothed: np.ndarray, rpm_original: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -1008,6 +1188,38 @@ class PowerAnalyzer:
         # Check if this is downsampled high-frequency data
         was_downsampled = hasattr(self, 'downsample_hz') and self.downsample_hz is not None
         
+        # CRITICAL: First calculate RAW power/torque for artifact detection (using unsmoothed RPM)
+        # This allows us to detect step artifacts before they're smoothed away
+        
+        # Calculate vehicle speed and acceleration using ORIGINAL (not smoothed) RPM for artifact detection
+        wheel_rpm_raw = rpm_monotonic / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
+        wheel_speed_rad_per_sec_raw = wheel_rpm_raw * 2 * np.pi / 60
+        vehicle_speed_ms_raw = wheel_speed_rad_per_sec_raw * tire_radius_m
+        
+        # Calculate raw acceleration for artifact detection
+        acceleration_raw = np.gradient(vehicle_speed_ms_raw, time_step)
+        
+        # Calculate raw power and torque for artifact detection
+        mass_kg = self.vehicle_specs.total_weight_kg
+        force_n_raw = mass_kg * acceleration_raw
+        rolling_resistance_force = mass_kg * AnalysisConstants.GRAVITY_MS2 * self.rolling_resistance
+        aero_drag_raw = 0.5 * AnalysisConstants.AIR_DENSITY_KG_M3 * self.drag_coefficient * self.frontal_area * vehicle_speed_ms_raw**2
+        total_force_raw = force_n_raw + rolling_resistance_force + aero_drag_raw
+        
+        power_watts_raw = total_force_raw * vehicle_speed_ms_raw
+        power_hp_raw = power_watts_raw / AnalysisConstants.WATTS_TO_HP
+        
+        wheel_torque_nm_raw = (total_force_raw * self.vehicle_specs.tire_circumference_m) / (2 * np.pi)
+        crank_torque_nm_raw = wheel_torque_nm_raw / (self.vehicle_specs.final_drive * self.vehicle_specs.gear_ratio)
+        torque_lbft_raw = crank_torque_nm_raw * AnalysisConstants.NM_TO_LBFT
+        
+        # Apply drivetrain efficiency to raw values
+        power_hp_raw = power_hp_raw / self.drivetrain_efficiency
+        
+        if debug_mode:
+            print(f"Raw power calculation completed for artifact detection")
+        
+        # NOW apply RPM smoothing for the final smoothed calculations
         # CRITICAL: Pre-smooth RPM data BEFORE calculating vehicle speed to prevent acceleration amplification
         # Even after downsampling and cleanup, micro-variations in RPM cause massive power oscillations
         if len(rpm) > 5:
@@ -1148,9 +1360,15 @@ class PowerAnalyzer:
         # For downsampled data, smooth power and torque INDEPENDENTLY to eliminate kinks
         # Then optionally apply HP-Torque correction to the final smoothed curves
         if len(power_hp) > 5:
-            # Apply aggressive smoothing to both power and torque independently
+            # CRITICAL: First, detect and smooth step artifacts using angle analysis on RAW power/torque
+            # This must happen BEFORE any other smoothing to catch the original ECU step artifacts
+            artifact_smoothed_power, artifact_smoothed_torque = self._detect_and_smooth_rpm_step_artifacts(
+                power_hp_raw, torque_lbft_raw, rpm_monotonic  # Use RAW values before any smoothing
+            )
+            
+            # Then apply general physics-aware smoothing to the artifact-corrected data
             smoothed_power_hp, smoothed_torque_lbft = self._apply_physics_aware_smoothing(
-                power_hp, torque_lbft, rpm_smoothed, run_data['Engine Speed'].values
+                artifact_smoothed_power, artifact_smoothed_torque, rpm_smoothed, run_data['Engine Speed'].values
             )
             
             # OPTIONALLY apply HP-Torque relationship correction to final smoothed curves
@@ -1437,12 +1655,13 @@ class PowerAnalyzer:
         
         plt.show()
     
-    def generate_debug_output(self, rpm_increment: int = 250) -> str:
+    def generate_debug_output(self, rpm_increment: int = 250, time_increment: float = None) -> str:
         """
-        Generate debug output with tabular power/torque data at RPM increments
+        Generate debug output with tabular power/torque data at RPM or time increments
         
         Args:
             rpm_increment: RPM increment for output rows (default: 250)
+            time_increment: Time increment for output rows (if specified, overrides rpm_increment)
             
         Returns:
             Formatted string with tabular output of power/torque curves
@@ -1462,6 +1681,7 @@ class PowerAnalyzer:
             run_data = self.data.iloc[start_idx:end_idx+1].copy()
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
             rpm = run_data['Engine Speed'].values
+            time_values = run_data['Section Time'].values
             
             # Filter out unrealistic values
             valid_mask = (power_hp > 0) & (power_hp < AnalysisConstants.MAX_REALISTIC_POWER) & (torque_lbft > 0) & (torque_lbft < AnalysisConstants.MAX_REALISTIC_TORQUE)
@@ -1471,6 +1691,7 @@ class PowerAnalyzer:
                     if valid_mask[j]:
                         all_data.append({
                             'rpm': rpm[j],
+                            'time': time_values[j],
                             'power': power_hp[j], 
                             'torque': torque_lbft[j],
                             'run': i + 1
@@ -1479,52 +1700,98 @@ class PowerAnalyzer:
         if not all_data:
             return "No valid data points found for debug output."
         
-        # Sort by RPM
-        all_data.sort(key=lambda x: x['rpm'])
-        
-        # Find RPM range
-        min_rpm = min(d['rpm'] for d in all_data)
-        max_rpm = max(d['rpm'] for d in all_data)
-        
-        # Create output at specified RPM increments
-        current_rpm = int(min_rpm / rpm_increment) * rpm_increment
-        if current_rpm < min_rpm:
-            current_rpm += rpm_increment
+        if time_increment is not None:
+            # Sort by time for time-based output
+            all_data.sort(key=lambda x: x['time'])
             
-        debug_output.extend([
-            f"RPM Range: {min_rpm:.0f} - {max_rpm:.0f}",
-            f"Output Increment: {rpm_increment} RPM",
-            f"Total Data Points: {len(all_data)} from {len(self.power_runs)} run(s)",
-            "",
-            f"{'RPM':>6} | {'Power (HP)':>10} | {'Torque (lb-ft)':>12} | {'Run #':>6} | Notes",
-            "-" * 55
-        ])
-        
-        while current_rpm <= max_rpm:
-            # Find the closest data point to this RPM
-            closest_data = min(all_data, key=lambda x: abs(x['rpm'] - current_rpm))
-            rpm_diff = abs(closest_data['rpm'] - current_rpm)
+            # Find time range
+            min_time = min(d['time'] for d in all_data)
+            max_time = max(d['time'] for d in all_data)
             
-            # Only output if we have data within reasonable range of target RPM
-            if rpm_diff <= rpm_increment * 0.6:  # Within 60% of increment
-                notes = ""
-                if rpm_diff > rpm_increment * 0.3:
-                    notes = f"±{rpm_diff:.0f} RPM"
+            # Create output at specified time increments
+            current_time = min_time
+            
+            debug_output.extend([
+                f"Time Range: {min_time:.3f} - {max_time:.3f} seconds",
+                f"Output Increment: {time_increment:.3f} seconds",
+                f"Total Data Points: {len(all_data)} from {len(self.power_runs)} run(s)",
+                "",
+                f"{'Time (s)':>8} | {'RPM':>6} | {'Power (HP)':>10} | {'Torque (lb-ft)':>12} | {'Run #':>6} | Notes",
+                "-" * 75
+            ])
+            
+            while current_time <= max_time:
+                # Find the closest data point to this time
+                closest_data = min(all_data, key=lambda x: abs(x['time'] - current_time))
+                time_diff = abs(closest_data['time'] - current_time)
                 
-                # Check for HP=Torque crossover at crossover RPM
-                if abs(current_rpm - AnalysisConstants.HP_TORQUE_CROSSOVER_RPM) <= rpm_increment / 2:
-                    hp_torque_diff = abs(closest_data['power'] - closest_data['torque'])
-                    if hp_torque_diff < 5:
-                        notes += " HP≈Torque" if notes else "HP≈Torque"
-                    else:
-                        notes += f" HP≠Torque({hp_torque_diff:.1f})" if notes else f"HP≠Torque({hp_torque_diff:.1f})"
+                # Only output if we have data within reasonable range of target time
+                if time_diff <= time_increment * 0.6:  # Within 60% of increment
+                    notes = ""
+                    if time_diff > time_increment * 0.3:
+                        notes = f"±{time_diff:.3f}s"
+                    
+                    # Check for HP=Torque crossover at crossover RPM
+                    if abs(closest_data['rpm'] - AnalysisConstants.HP_TORQUE_CROSSOVER_RPM) <= 50:
+                        hp_torque_diff = abs(closest_data['power'] - closest_data['torque'])
+                        if hp_torque_diff < 5:
+                            notes += " HP≈Torque" if notes else "HP≈Torque"
+                        else:
+                            notes += f" HP≠Torque({hp_torque_diff:.1f})" if notes else f"HP≠Torque({hp_torque_diff:.1f})"
+                    
+                    debug_output.append(
+                        f"{current_time:>8.3f} | {closest_data['rpm']:>6.0f} | {closest_data['power']:>10.1f} | {closest_data['torque']:>12.1f} | "
+                        f"{closest_data['run']:>6} | {notes}"
+                    )
                 
-                debug_output.append(
-                    f"{current_rpm:>6} | {closest_data['power']:>10.1f} | {closest_data['torque']:>12.1f} | "
-                    f"{closest_data['run']:>6} | {notes}"
-                )
+                current_time += time_increment
+        else:
+            # Sort by RPM for RPM-based output (original behavior)
+            all_data.sort(key=lambda x: x['rpm'])
             
-            current_rpm += rpm_increment
+            # Find RPM range
+            min_rpm = min(d['rpm'] for d in all_data)
+            max_rpm = max(d['rpm'] for d in all_data)
+            
+            # Create output at specified RPM increments
+            current_rpm = int(min_rpm / rpm_increment) * rpm_increment
+            if current_rpm < min_rpm:
+                current_rpm += rpm_increment
+                
+            debug_output.extend([
+                f"RPM Range: {min_rpm:.0f} - {max_rpm:.0f}",
+                f"Output Increment: {rpm_increment} RPM",
+                f"Total Data Points: {len(all_data)} from {len(self.power_runs)} run(s)",
+                "",
+                f"{'RPM':>6} | {'Power (HP)':>10} | {'Torque (lb-ft)':>12} | {'Run #':>6} | Notes",
+                "-" * 55
+            ])
+            
+            while current_rpm <= max_rpm:
+                # Find the closest data point to this RPM
+                closest_data = min(all_data, key=lambda x: abs(x['rpm'] - current_rpm))
+                rpm_diff = abs(closest_data['rpm'] - current_rpm)
+                
+                # Only output if we have data within reasonable range of target RPM
+                if rpm_diff <= rpm_increment * 0.6:  # Within 60% of increment
+                    notes = ""
+                    if rpm_diff > rpm_increment * 0.3:
+                        notes = f"±{rpm_diff:.0f} RPM"
+                    
+                    # Check for HP=Torque crossover at crossover RPM
+                    if abs(current_rpm - AnalysisConstants.HP_TORQUE_CROSSOVER_RPM) <= rpm_increment / 2:
+                        hp_torque_diff = abs(closest_data['power'] - closest_data['torque'])
+                        if hp_torque_diff < 5:
+                            notes += " HP≈Torque" if notes else "HP≈Torque"
+                        else:
+                            notes += f" HP≠Torque({hp_torque_diff:.1f})" if notes else f"HP≠Torque({hp_torque_diff:.1f})"
+                    
+                    debug_output.append(
+                        f"{current_rpm:>6} | {closest_data['power']:>10.1f} | {closest_data['torque']:>12.1f} | "
+                        f"{closest_data['run']:>6} | {notes}"
+                    )
+                
+                current_rpm += rpm_increment
         
         # Add summary statistics
         all_power = [d['power'] for d in all_data]
@@ -1735,6 +2002,8 @@ Examples:
     parser.add_argument('--debug', action='store_true', help='Enable debug mode - output tabular data instead of graph')
     parser.add_argument('--debug-rpm-increment', type=int, default=250, 
                        help='RPM increment for debug mode output (default: 250)')
+    parser.add_argument('--debug-time-increment', type=float, default=None, 
+                       help='Time increment for debug mode output in seconds (overrides rpm increment if specified)')
     
     args = parser.parse_args()
     
@@ -1776,7 +2045,7 @@ Examples:
         if analyzer.power_runs:
             if args.debug:
                 # Debug mode - output tabular data
-                print(analyzer.generate_debug_output(args.debug_rpm_increment))
+                print(analyzer.generate_debug_output(args.debug_rpm_increment, args.debug_time_increment))
             else:
                 # Normal mode - generate report and plot
                 print(analyzer.generate_report())
