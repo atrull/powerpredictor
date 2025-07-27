@@ -1343,6 +1343,144 @@ class PowerAnalyzer:
         
         plt.show()
     
+    def generate_debug_output(self, rpm_increment: int = 250) -> str:
+        """
+        Generate debug output with tabular power/torque data at RPM increments
+        
+        Args:
+            rpm_increment: RPM increment for output rows (default: 250)
+            
+        Returns:
+            Formatted string with tabular output of power/torque curves
+        """
+        if not self.power_runs:
+            return "No power runs found for debug output."
+        
+        debug_output = ["Debug Mode - Tabular Power/Torque Output", "=" * 50, ""]
+        
+        # Collect all power/torque data from all runs
+        all_data = []
+        
+        for i, run in enumerate(self.power_runs):
+            # Apply frame trimming
+            start_idx = run['start_idx'] + self.trim_frames
+            end_idx = run['end_idx'] - self.trim_frames
+            
+            if end_idx <= start_idx:
+                continue
+                
+            run_data = self.data.iloc[start_idx:end_idx+1].copy()
+            power_hp, torque_lbft = self.calculate_power_torque(run_data)
+            rpm = run_data['Engine Speed'].values
+            
+            # Filter out unrealistic values
+            valid_mask = (power_hp > 0) & (power_hp < 1000) & (torque_lbft > 0) & (torque_lbft < 1000)
+            
+            if np.any(valid_mask):
+                for j in range(len(rpm)):
+                    if valid_mask[j]:
+                        all_data.append({
+                            'rpm': rpm[j],
+                            'power': power_hp[j], 
+                            'torque': torque_lbft[j],
+                            'run': i + 1
+                        })
+        
+        if not all_data:
+            return "No valid data points found for debug output."
+        
+        # Sort by RPM
+        all_data.sort(key=lambda x: x['rpm'])
+        
+        # Find RPM range
+        min_rpm = min(d['rpm'] for d in all_data)
+        max_rpm = max(d['rpm'] for d in all_data)
+        
+        # Create output at specified RPM increments
+        current_rpm = int(min_rpm / rpm_increment) * rpm_increment
+        if current_rpm < min_rpm:
+            current_rpm += rpm_increment
+            
+        debug_output.extend([
+            f"RPM Range: {min_rpm:.0f} - {max_rpm:.0f}",
+            f"Output Increment: {rpm_increment} RPM",
+            f"Total Data Points: {len(all_data)} from {len(self.power_runs)} run(s)",
+            "",
+            f"{'RPM':>6} | {'Power (HP)':>10} | {'Torque (lb-ft)':>12} | {'Run #':>6} | Notes",
+            "-" * 55
+        ])
+        
+        while current_rpm <= max_rpm:
+            # Find the closest data point to this RPM
+            closest_data = min(all_data, key=lambda x: abs(x['rpm'] - current_rpm))
+            rpm_diff = abs(closest_data['rpm'] - current_rpm)
+            
+            # Only output if we have data within reasonable range of target RPM
+            if rpm_diff <= rpm_increment * 0.6:  # Within 60% of increment
+                notes = ""
+                if rpm_diff > rpm_increment * 0.3:
+                    notes = f"±{rpm_diff:.0f} RPM"
+                
+                # Check for HP=Torque crossover at 5252 RPM
+                if abs(current_rpm - 5252) <= rpm_increment / 2:
+                    hp_torque_diff = abs(closest_data['power'] - closest_data['torque'])
+                    if hp_torque_diff < 5:
+                        notes += " HP≈Torque" if notes else "HP≈Torque"
+                    else:
+                        notes += f" HP≠Torque({hp_torque_diff:.1f})" if notes else f"HP≠Torque({hp_torque_diff:.1f})"
+                
+                debug_output.append(
+                    f"{current_rpm:>6} | {closest_data['power']:>10.1f} | {closest_data['torque']:>12.1f} | "
+                    f"{closest_data['run']:>6} | {notes}"
+                )
+            
+            current_rpm += rpm_increment
+        
+        # Add summary statistics
+        all_power = [d['power'] for d in all_data]
+        all_torque = [d['torque'] for d in all_data]
+        all_rpm_vals = [d['rpm'] for d in all_data]
+        
+        max_power = max(all_power)
+        max_torque = max(all_torque)
+        max_power_idx = all_power.index(max_power)
+        max_torque_idx = all_torque.index(max_torque)
+        
+        debug_output.extend([
+            "",
+            "Summary Statistics:",
+            "-" * 20,
+            f"Peak Power:  {max_power:.1f} HP @ {all_rpm_vals[max_power_idx]:.0f} RPM",
+            f"Peak Torque: {max_torque:.1f} lb-ft @ {all_rpm_vals[max_torque_idx]:.0f} RPM",
+            f"Power Range: {min(all_power):.1f} - {max(all_power):.1f} HP",
+            f"Torque Range: {min(all_torque):.1f} - {max(all_torque):.1f} lb-ft"
+        ])
+        
+        # Add environmental conditions if available
+        env_data = []
+        for run in self.power_runs:
+            start_idx = run['start_idx'] + self.trim_frames
+            end_idx = run['end_idx'] - self.trim_frames
+            
+            if end_idx > start_idx:
+                run_data = self.data.iloc[start_idx:end_idx+1]
+                
+                if 'BAP' in run_data.columns:
+                    bap_values = run_data['BAP'].dropna()
+                    if len(bap_values) > 0:
+                        env_data.append(f"BAP: {np.mean(bap_values):.1f} kPa")
+                
+                if 'IAT' in run_data.columns:
+                    iat_values = run_data['IAT'].dropna()
+                    if len(iat_values) > 0:
+                        env_data.append(f"IAT: {np.mean(iat_values):.0f}°C")
+                break  # Only need one run for env conditions
+        
+        if env_data:
+            debug_output.extend(["", "Environmental Conditions:"] + env_data)
+        
+        return "\n".join(debug_output)
+
     def generate_report(self) -> str:
         """Generate a text report of the analysis"""
         if not self.power_runs:
@@ -1513,6 +1651,9 @@ Examples:
     parser.add_argument('--out', help='Output file for plot (optional)')
     parser.add_argument('--title', help='Custom title for the plot')
     parser.add_argument('--no-plot', action='store_true', help='Skip generating plot')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode - output tabular data instead of graph')
+    parser.add_argument('--debug-rpm-increment', type=int, default=250, 
+                       help='RPM increment for debug mode output (default: 250)')
     
     args = parser.parse_args()
     
@@ -1553,9 +1694,14 @@ Examples:
         )
         
         if analyzer.power_runs:
-            print(analyzer.generate_report())
-            if not args.no_plot:
-                analyzer.plot_power_curves(args.out, args.title)
+            if args.debug:
+                # Debug mode - output tabular data
+                print(analyzer.generate_debug_output(args.debug_rpm_increment))
+            else:
+                # Normal mode - generate report and plot
+                print(analyzer.generate_report())
+                if not args.no_plot:
+                    analyzer.plot_power_curves(args.out, args.title)
         else:
             print("No valid power runs found in the data.")
             print(f"Try adjusting --throttle-threshold (currently {args.throttle_threshold}%)")
