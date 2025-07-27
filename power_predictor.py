@@ -674,34 +674,17 @@ class PowerAnalyzer:
         # Combine artifacts (if either power or torque shows artifact, treat as step)
         step_artifacts = power_artifacts | torque_artifacts
         
-        # Debug: Check for specific known artifacts around 3836 and 4252 RPM
-        debug_rpms = [3836, 4252]
-        for debug_rpm in debug_rpms:
-            closest_idx = np.argmin(np.abs(rpm - debug_rpm))
-            if closest_idx < len(power_slopes):
-                slope_idx = closest_idx if closest_idx < len(power_slopes) else len(power_slopes) - 1
-                power_dev = power_slope_deviations[slope_idx] if slope_idx < len(power_slope_deviations) else 0
-                torque_dev = torque_slope_deviations[slope_idx] if slope_idx < len(torque_slope_deviations) else 0
-                
-                # Additional debug info
-                actual_power_slope = power_slopes[slope_idx] if slope_idx < len(power_slopes) else 0
-                expected_power_slope = expected_power_slopes[slope_idx] if slope_idx < len(expected_power_slopes) else 0
-                actual_torque_slope = torque_slopes[slope_idx] if slope_idx < len(torque_slopes) else 0
-                expected_torque_slope = expected_torque_slopes[slope_idx] if slope_idx < len(expected_torque_slopes) else 0
-                
-                # Show power/torque values around this point
-                start_check = max(0, closest_idx - 2)
-                end_check = min(len(power_hp), closest_idx + 3)
-                power_window = power_hp[start_check:end_check]
-                torque_window = torque_lbft[start_check:end_check]
-                rpm_window = rpm[start_check:end_check]
-                
-                print(f"Debug artifact check at {debug_rpm} RPM (idx {closest_idx}, slope_idx {slope_idx}):")
-                print(f"  Power: actual_slope={actual_power_slope:.3f}, expected_slope={expected_power_slope:.3f}, deviation={power_dev:.3f} (thresh={power_slope_threshold:.3f})")
-                print(f"  Torque: actual_slope={actual_torque_slope:.3f}, expected_slope={expected_torque_slope:.3f}, deviation={torque_dev:.3f} (thresh={torque_slope_threshold:.3f})")
-                print(f"  Power values around {debug_rpm}: {power_window}")
-                print(f"  Torque values around {debug_rpm}: {torque_window}")
-                print(f"  RPM values around {debug_rpm}: {rpm_window}")
+        # Debug: Check for specific known artifacts around 3836 and 4252 RPM (disabled for now)
+        if False:  # Temporarily disable verbose debug output
+            debug_rpms = [3836, 4252]
+            for debug_rpm in debug_rpms:
+                closest_idx = np.argmin(np.abs(rpm - debug_rpm))
+                if closest_idx < len(power_slopes):
+                    slope_idx = closest_idx if closest_idx < len(power_slopes) else len(power_slopes) - 1
+                    power_dev = power_slope_deviations[slope_idx] if slope_idx < len(power_slope_deviations) else 0
+                    torque_dev = torque_slope_deviations[slope_idx] if slope_idx < len(torque_slope_deviations) else 0
+                    
+                    print(f"Debug artifact check at {debug_rpm} RPM: power_dev={power_dev:.3f}, torque_dev={torque_dev:.3f}")
         
         if np.any(step_artifacts):
             artifact_indices = np.where(step_artifacts)[0]
@@ -770,7 +753,7 @@ class PowerAnalyzer:
                                 weights * expected_torque + (1 - weights) * original_torque
                             )
                             
-                            print(f"  Smoothed artifact at {rpm[step_point]:.0f} RPM")
+                            # print(f"  Smoothed artifact at {rpm[step_point]:.0f} RPM")  # Disabled for debugging
                             
                         except np.linalg.LinAlgError:
                             # Fallback to simple interpolation if polyfit fails
@@ -1360,10 +1343,10 @@ class PowerAnalyzer:
         # For downsampled data, smooth power and torque INDEPENDENTLY to eliminate kinks
         # Then optionally apply HP-Torque correction to the final smoothed curves
         if len(power_hp) > 5:
-            # CRITICAL: First, detect and smooth step artifacts using angle analysis on RAW power/torque
-            # This must happen BEFORE any other smoothing to catch the original ECU step artifacts
+            # CRITICAL: First, detect and smooth step artifacts using angle analysis
+            # Use the processed power/torque with smoothed RPM to maintain array consistency
             artifact_smoothed_power, artifact_smoothed_torque = self._detect_and_smooth_rpm_step_artifacts(
-                power_hp_raw, torque_lbft_raw, rpm_monotonic  # Use RAW values before any smoothing
+                power_hp, torque_lbft, rpm_smoothed  # Use processed values to maintain array consistency
             )
             
             # Then apply general physics-aware smoothing to the artifact-corrected data
