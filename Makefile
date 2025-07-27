@@ -33,5 +33,6 @@ white-unfiltered:
 black:
 	# should be 4th gear 1.0 ratio but that predicts too much power
 	MPLBACKEND=Agg uv run python power_predictor.py black.csv --weight 1022 --occupant 85 --gear-ratio 1.33 --final-drive 4.3 --displacement 1.6 --smoothing-factor 5 --max-gap 15 --out black.png
+	MPLBACKEND=Agg uv run python power_predictor.py black.csv --weight 1022 --occupant 85 --gear-ratio 1.33 --final-drive 4.3 --displacement 1.6 --smoothing-factor 25 --max-gap 15 --out black-smoother.png
 
 all: k20 white black

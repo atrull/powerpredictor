@@ -39,11 +39,10 @@ class AnalysisConstants:
     
     # Analysis defaults
     DEFAULT_THROTTLE_THRESHOLD = 96
-    DEFAULT_MIN_RPM = 2000
+    DEFAULT_MIN_RPM = 1500
     DEFAULT_MIN_DURATION = 1.0
     DEFAULT_MIN_RPM_RANGE = 2500
     DEFAULT_SMOOTHING_FACTOR = 2.5
-    DEFAULT_TRIM_FRAMES = 20
     DEFAULT_MAX_GAP = 5
     
     # Data quality thresholds
@@ -93,7 +92,6 @@ class PowerAnalyzer:
                  smoothing_factor: float = 2.5,
                  apply_hp_torque_correction: bool = True,
                  filter_rpm_data: bool = True,
-                 trim_frames: int = 20,
                  max_gap: int = 5,
                  downsample_hz: float = None):
         self.vehicle_specs = vehicle_specs
@@ -104,7 +102,6 @@ class PowerAnalyzer:
         self.smoothing_factor = smoothing_factor
         self.apply_hp_torque_correction = apply_hp_torque_correction
         self.filter_rpm_data = filter_rpm_data
-        self.trim_frames = trim_frames
         self.max_gap = max_gap
         self.downsample_hz = downsample_hz
         self.data = None
@@ -819,22 +816,72 @@ class PowerAnalyzer:
         if tps_col not in self.data.columns or 'Engine Speed' not in self.data.columns:
             raise ValueError("Required columns (TPS, Engine Speed) not found in data")
         
-        # Find WOT conditions using configurable threshold
-        wot_mask = self.data[tps_col] >= throttle_threshold
+        # Enhanced WOT detection with hysteresis to handle brief throttle dips
+        # Use a rolling window to smooth throttle readings and detect sustained high throttle
+        throttle_window = min(5, len(self.data) // 40)
+        if throttle_window < 3:
+            throttle_window = 3
+            
+        # Rolling average throttle position
+        smoothed_tps = self.data[tps_col].rolling(window=throttle_window, center=True, min_periods=1).mean()
         
-        # Calculate RPM rate of change (less aggressive filtering)
-        rpm_diff = self.data['Engine Speed'].diff().rolling(window=3, center=True).mean()
-        stable_increase = rpm_diff > -10  # Allow small RPM decreases for downsampled data
+        # Primary WOT condition: sustained high throttle
+        primary_wot_mask = smoothed_tps >= throttle_threshold
         
-        # Combine conditions - lower RPM threshold
-        valid_conditions = wot_mask & stable_increase & (self.data['Engine Speed'] > AnalysisConstants.DEFAULT_MIN_RPM)
+        # Secondary WOT condition: allow slightly lower throttle (90%) if RPM is increasing rapidly
+        # This catches the end of power runs where throttle may dip but power is still being made
+        secondary_wot_mask = self.data[tps_col] >= (throttle_threshold - 6)  # 90% for 96% threshold
+        
+        # Progressive WOT condition: allow lower throttle at beginning if acceleration is strong
+        # This catches the start of power runs where throttle is building up
+        progressive_wot_mask = self.data[tps_col] >= 80
+        
+        # Enhanced sustained acceleration detection
+        # Calculate time-based RPM acceleration (RPM/sec) using a rolling window
+        time_diffs = self.data['Section Time'].diff()
+        rpm_diffs = self.data['Engine Speed'].diff()
+        
+        # Calculate instantaneous acceleration (RPM/sec)
+        instantaneous_accel = rpm_diffs / time_diffs
+        
+        # Use a rolling window to smooth acceleration and detect sustained increases
+        window_size = min(10, len(self.data) // 20)  # Adaptive window size
+        if window_size < 3:
+            window_size = 3
+            
+        # Rolling average acceleration over the window
+        sustained_accel = instantaneous_accel.rolling(window=window_size, center=True, min_periods=2).mean()
+        
+        # Detect different types of valid acceleration periods
+        # Strong acceleration: definitive power pull
+        strong_acceleration = sustained_accel > 100  # Strong acceleration threshold
+        
+        # Moderate acceleration: steady power delivery
+        moderate_acceleration = sustained_accel > 25  # Moderate acceleration threshold
+        
+        # Maintain RPM: high RPM with minimal deceleration (end of power band)
+        maintain_rpm = (sustained_accel > -100) & (self.data['Engine Speed'] > 4000)
+        
+        # Combine acceleration conditions
+        acceleration_condition = strong_acceleration | (moderate_acceleration & secondary_wot_mask) | (maintain_rpm & secondary_wot_mask)
+        
+        # Combine WOT and acceleration conditions
+        # Primary: Full WOT with any valid acceleration
+        # Secondary: High throttle (90%+) with strong acceleration or high RPM maintenance  
+        # Progressive: Lower throttle (80%+) but only with very strong acceleration (early power run)
+        wot_condition = (primary_wot_mask | 
+                        (secondary_wot_mask & (strong_acceleration | maintain_rpm)) |
+                        (progressive_wot_mask & strong_acceleration & (self.data['Engine Speed'] < 3000)))
+        
+        # Final valid conditions
+        valid_conditions = wot_condition & acceleration_condition & (self.data['Engine Speed'] > AnalysisConstants.DEFAULT_MIN_RPM)
         
         # Find continuous runs with gap tolerance to merge close runs
         runs = []
         in_run = False
         start_idx = None
         gap_count = 0
-        max_gap = self.max_gap  # Allow configurable consecutive invalid samples before ending a run
+        max_gap = max(self.max_gap, 15)  # Increase minimum gap tolerance for better run detection
         
         for i, valid in enumerate(valid_conditions):
             if valid and not in_run:
@@ -890,9 +937,26 @@ class PowerAnalyzer:
                 })
         
         self.power_runs = runs
-        print(f"Found {len(runs)} valid power runs")
-        if self.trim_frames > 0:
-            print(f"Note: {self.trim_frames} frames will be trimmed from start/end of each run for analysis")
+        
+        # Debug information about detection criteria
+        if len(runs) > 0:
+            print(f"Found {len(runs)} valid power runs with enhanced detection:")
+            for i, run in enumerate(runs):
+                print(f"  Run {i+1}: {run['start_rpm']:.0f}-{run['end_rpm']:.0f} RPM, {run['duration']:.1f}s")
+        else:
+            # Provide diagnostic information when no runs found
+            wot_samples = np.sum(wot_mask)
+            accel_samples = np.sum(acceleration_condition)
+            rpm_samples = np.sum(self.data['Engine Speed'] > AnalysisConstants.DEFAULT_MIN_RPM)
+            combined_samples = np.sum(valid_conditions)
+            
+            print(f"No power runs found. Diagnostic info:")
+            print(f"  Samples with TPS ≥ {throttle_threshold}%: {wot_samples}")
+            print(f"  Samples with good acceleration: {accel_samples}")
+            print(f"  Samples with RPM > {AnalysisConstants.DEFAULT_MIN_RPM}: {rpm_samples}")
+            print(f"  Samples meeting all conditions: {combined_samples}")
+            print(f"  Try lowering --throttle-threshold or --min-rpm-range")
+        
         return runs
     
     def calculate_power_torque(self, run_data, debug_mode: bool = False) -> Tuple[np.ndarray, np.ndarray]:
@@ -1174,14 +1238,8 @@ class PowerAnalyzer:
         
         # Plot individual runs
         for i, run in enumerate(self.power_runs):
-            # Apply frame trimming to clean up start/end values
-            start_idx = run['start_idx'] + self.trim_frames
-            end_idx = run['end_idx'] - self.trim_frames
-            
-            # Ensure we have enough data after trimming
-            if end_idx <= start_idx:
-                print(f"Warning: Run {i+1} too short after trimming {self.trim_frames} frames from each end")
-                continue
+            start_idx = run['start_idx']
+            end_idx = run['end_idx']
                 
             run_data = self.data.iloc[start_idx:end_idx+1].copy()
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
@@ -1303,23 +1361,21 @@ class PowerAnalyzer:
             all_iat = []
             
             for run in self.power_runs:
-                start_idx = run['start_idx'] + self.trim_frames
-                end_idx = run['end_idx'] - self.trim_frames
+                start_idx = run['start_idx']
+                end_idx = run['end_idx']
+                run_data = self.data.iloc[start_idx:end_idx+1]
                 
-                if end_idx > start_idx:
-                    run_data = self.data.iloc[start_idx:end_idx+1]
-                    
-                    # Collect BAP values
-                    if 'BAP' in run_data.columns:
-                        bap_values = run_data['BAP'].dropna()
-                        if len(bap_values) > 0:
-                            all_bap.extend(bap_values.tolist())
-                    
-                    # Collect IAT values
-                    if 'IAT' in run_data.columns:
-                        iat_values = run_data['IAT'].dropna()
-                        if len(iat_values) > 0:
-                            all_iat.extend(iat_values.tolist())
+                # Collect BAP values
+                if 'BAP' in run_data.columns:
+                    bap_values = run_data['BAP'].dropna()
+                    if len(bap_values) > 0:
+                        all_bap.extend(bap_values.tolist())
+                
+                # Collect IAT values
+                if 'IAT' in run_data.columns:
+                    iat_values = run_data['IAT'].dropna()
+                    if len(iat_values) > 0:
+                        all_iat.extend(iat_values.tolist())
             
             # Format environmental conditions
             if all_bap:
@@ -1357,13 +1413,10 @@ class PowerAnalyzer:
                 full_run_time = full_run_data['Section Time'].values
                 ax_coverage.plot(full_run_time, [1] * len(full_run_time), color=colors[i], linewidth=2, alpha=0.3)
                 
-                # Show trimmed run (actually used for analysis) in bold color
-                start_idx = run['start_idx'] + self.trim_frames
-                end_idx = run['end_idx'] - self.trim_frames
-                if end_idx > start_idx:
-                    trimmed_run_data = self.data.iloc[start_idx:end_idx+1]
-                    trimmed_run_time = trimmed_run_data['Section Time'].values
-                    ax_coverage.plot(trimmed_run_time, [1] * len(trimmed_run_time), color=colors[i], linewidth=4, alpha=0.8, label=f'Run {i+1} (trimmed)')
+                # Show analysis run data in bold color
+                analysis_run_data = self.data.iloc[run['start_idx']:run['end_idx']+1]
+                analysis_run_time = analysis_run_data['Section Time'].values
+                ax_coverage.plot(analysis_run_time, [1] * len(analysis_run_time), color=colors[i], linewidth=4, alpha=0.8, label=f'Run {i+1}')
             
             # Format coverage plot
             ax_coverage.set_xlabel('Time (seconds)', fontsize=10)
@@ -1403,12 +1456,8 @@ class PowerAnalyzer:
         all_data = []
         
         for i, run in enumerate(self.power_runs):
-            # Apply frame trimming
-            start_idx = run['start_idx'] + self.trim_frames
-            end_idx = run['end_idx'] - self.trim_frames
-            
-            if end_idx <= start_idx:
-                continue
+            start_idx = run['start_idx']
+            end_idx = run['end_idx']
                 
             run_data = self.data.iloc[start_idx:end_idx+1].copy()
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
@@ -1500,22 +1549,20 @@ class PowerAnalyzer:
         # Add environmental conditions if available
         env_data = []
         for run in self.power_runs:
-            start_idx = run['start_idx'] + self.trim_frames
-            end_idx = run['end_idx'] - self.trim_frames
+            start_idx = run['start_idx']
+            end_idx = run['end_idx']
+            run_data = self.data.iloc[start_idx:end_idx+1]
             
-            if end_idx > start_idx:
-                run_data = self.data.iloc[start_idx:end_idx+1]
-                
-                if 'BAP' in run_data.columns:
-                    bap_values = run_data['BAP'].dropna()
-                    if len(bap_values) > 0:
-                        env_data.append(f"BAP: {np.mean(bap_values):.1f} kPa")
-                
-                if 'IAT' in run_data.columns:
-                    iat_values = run_data['IAT'].dropna()
-                    if len(iat_values) > 0:
-                        env_data.append(f"IAT: {np.mean(iat_values):.0f}°C")
-                break  # Only need one run for env conditions
+            if 'BAP' in run_data.columns:
+                bap_values = run_data['BAP'].dropna()
+                if len(bap_values) > 0:
+                    env_data.append(f"BAP: {np.mean(bap_values):.1f} kPa")
+            
+            if 'IAT' in run_data.columns:
+                iat_values = run_data['IAT'].dropna()
+                if len(iat_values) > 0:
+                    env_data.append(f"IAT: {np.mean(iat_values):.0f}°C")
+            break  # Only need one run for env conditions
         
         if env_data:
             debug_output.extend(["", "Environmental Conditions:"] + env_data)
@@ -1547,13 +1594,8 @@ class PowerAnalyzer:
         ])
         
         for i, run in enumerate(self.power_runs):
-            # Apply frame trimming to clean up start/end values
-            start_idx = run['start_idx'] + self.trim_frames
-            end_idx = run['end_idx'] - self.trim_frames
-            
-            # Ensure we have enough data after trimming
-            if end_idx <= start_idx:
-                continue
+            start_idx = run['start_idx']
+            end_idx = run['end_idx']
                 
             run_data = self.data.iloc[start_idx:end_idx+1]
             power_hp, torque_lbft = self.calculate_power_torque(run_data)
@@ -1673,8 +1715,6 @@ Examples:
                        help='Disable HP-Torque relationship correction (HP = Torque * RPM / 5252)')
     parser.add_argument('--no-rpm-filtering', action='store_true', 
                        help='Disable RPM data filtering (keeps duplicate/bad ECU readings)')
-    parser.add_argument('--trim-frames', type=int, default=AnalysisConstants.DEFAULT_TRIM_FRAMES, 
-                       help='Number of frames to trim from start/end of each run for cleaner data (default: 20)')
     parser.add_argument('--max-gap', type=int, default=AnalysisConstants.DEFAULT_MAX_GAP, 
                        help='Maximum consecutive invalid samples allowed before ending a power run (default: 5)')
     parser.add_argument('--downsample-hz', type=float, default=None, 
@@ -1722,7 +1762,6 @@ Examples:
             smoothing_factor=args.smoothing_factor,
             apply_hp_torque_correction=not args.no_hp_torque_correction,
             filter_rpm_data=not args.no_rpm_filtering,
-            trim_frames=args.trim_frames,
             max_gap=args.max_gap,
             downsample_hz=args.downsample_hz
         )
@@ -1831,5 +1870,4 @@ TROUBLESHOOTING:
 - If no power runs found, try lowering --throttle-threshold
 - If runs are too short, adjust --min-duration or --min-rpm-range
 - If RPM data looks erratic, keep --filter-rpm-data enabled (default)
-- Use --trim-frames to clean up start/end of detected runs
 """
