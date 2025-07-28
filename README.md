@@ -8,7 +8,7 @@ This tool analyzes CSV logs from ECUs to determine power and torque by analyzing
 
 It is best used for comparing runs between tunes of the same vehicle on the same day, or for getting a 'picture' without needing to hire a dyno.
 
-![alt text](test-unfiltered.png "Unfiltered Screenshot")
+![alt text](k20.png " Screenshot")
 
 ## How ECUs log
 
