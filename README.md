@@ -26,9 +26,9 @@ Some ECUs (the G4X, for instance) support mixed frequency onboard logging. One p
 
 ## Limitations
 
-- Inputs are only as good as outputs, setting up a dyno is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, etc. The more correct the inputs, the more potentially accurate become the outputs.
+- GIGO: Outputs are only as good as Inputs, setting up a dyno takes serious time, and is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, precisely inputting all parameters. The more correct the inputs, the more potentially accurate become the outputs.
 - Log should be made on a flat road without interruption. Any incline will reduce the graphed power. Any descent will increase the graphed power.
-- Some ECUs only log a change in RPM every time they process a cylinder 1 ignition event, or the CAM or Crank angle sensor fires again. The hardware side of the ECU will process the firing just fine but the software side (logging) is a secondary concern.
+- Some ECUs only log a change in RPM every time they process a cylinder 1 ignition event, or the CAM or Crank angle sensor fires again. The hardware side of the ECU will process the firing just fine but the software side (logging) is a secondary concern. Some ECUs may even log reversions in RPM even though this is not physically possible during a power run.
 - Only works with G4X [the developer only has G4X ECUs] (but could be extended to others easily.)
 
 ## Features
