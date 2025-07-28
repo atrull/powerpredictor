@@ -28,6 +28,7 @@ Some ECUs (the G4X, for instance) support mixed frequency onboard logging. One p
 
 - Inputs are only as good as outputs, setting up a dyno is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, etc. The more correct the inputs, the more potentially accurate become the outputs.
 - Log should be made on a flat road without interruption. Any incline will reduce the graphed power. Any descent will increase the graphed power.
+- Some ECUs only log a change in RPM every time they process a cylinder 1 ignition event, or the CAM or Crank angle sensor fires again. The hardware side of the ECU will process the firing just fine but the software side (logging) is a secondary concern.
 - Only works with G4X [the developer only has G4X ECUs] (but could be extended to others easily.)
 
 ## Features
@@ -99,7 +100,6 @@ python power_predictor.py "your_log.csv" \
 
 #### Data Processing
 - `--smoothing-factor`: Data smoothing factor - 0 disables, higher values = more smoothing (default: 2.5)
-- `--trim-frames`: Number of frames to trim from start/end of each run for cleaner data (default: 20)
 - `--max-gap`: Maximum consecutive invalid samples allowed before ending a power run (default: 5)
 - `--downsample-hz`: Downsample data to specified frequency in Hz (e.g., 50 for high-frequency ECU logs)
 - `--no-hp-torque-correction`: Disable HP-Torque relationship correction (HP = Torque * RPM / 5252)
