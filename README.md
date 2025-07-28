@@ -1,6 +1,6 @@
 # Power Predictor
 
-A tool for analyzing ECU log data to calculate power and torque curves, similar to a dynamometer. Inspired by Virtual Dyno but lacking all the testing, calibration and so on that that has (we think) undergone.
+A tool for analyzing ECU log data to calculate power and torque curves, similar to a dynamometer. Inspired by Virtual Dyno [https://barnhill.bitbucket.io/] by Brad Barnhill [https://www.bradbarnhill.com/] but lacking all the testing, calibration and so on that that has (we hope) undergone.
 
 ## Overview
 
