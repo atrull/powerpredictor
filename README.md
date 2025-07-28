@@ -10,17 +10,21 @@ It is best used for comparing runs between tunes of the same vehicle on the same
 
 ![alt text](test-unfiltered.png "Unfiltered Screenshot")
 
-## How it ECU Logging works imperfectly
+## How ECUs log
 
-ECUs log as a secondary or tertiary downstream function for diagnosis, they do not log as a primary concern. This means that reported RPM is not necessarily realtime. Typically an ECU has dedicated physical hardware for firing injectors and spark plug coils and a miriad other things related to power train, emissions and safety. 
+ECUs log as a secondary or tertiary downstream function for diagnosis, they do not log as a primary concern. This means that reported RPM is not necessarily realtime. Typically an ECU has dedicated physical hardware for firing injectors and spark plug coils and a miriad other things related to power train, emissions and safety.
 
 As such, the log at best is a blurry view of what the ECU was doing and cannot accurately show the time of an event, but rather a picture of the state of the engine in broad terms.
 
 Using this broad data and with some load/wheel calculations, we can get an idea of the engine performance. The idea is that the logged ramp of RPM can be used to back-calculate the power generated - i.e. simply: for acceleration to continue at X rate with Y (load * wheel size * drive ratio * other parameters) it takes Z torque. Torque values are then converted to HP using standard formula.
 
+### Mixed Frequency Logging
+
+Some ECUs (the G4X, for instance) support mixed frequency onboard logging. One parameter might log at 1000hz and another might log at 50hz - based on just two parameters the will have, the 50hz parameters will be repeated in the log without change for 20 rows whereas each of these rows might have a different value for the 1000hz parameter.
+
 ## Limitations
 
-- Inputs are only as good as outputs, setting up a dyno is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, etc. You must gather a lot of accurate data to use this tool.
+- Inputs are only as good as outputs, setting up a dyno is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, etc. The more correct the inputs, the more potentially accurate become the outputs.
 - Only works with G4X [the developer only has G4X ECUs] (but could be extended to others easily.)
 
 ## Features
@@ -123,22 +127,22 @@ The tool expects a CSV file with ECU log data containing these columns:
 
 ## How It Works
 
-1. **Data Loading & Cleaning**: 
+1. **Data Loading & Cleaning**:
    - Loads CSV data and cleans column names
    - Filters problematic RPM readings (duplicates, reversions)
    - Applies configurable data smoothing
 
-2. **Power Run Detection**: 
+2. **Power Run Detection**:
    - Identifies periods where throttle position ≥ 99.5% and RPM is increasing steadily
    - Bridges brief gaps (up to 3 consecutive invalid samples) to merge continuous runs
    - Applies minimum duration and RPM range requirements
 
-3. **Frame Trimming**: 
+3. **Frame Trimming**:
    - Removes configurable number of frames (default 20) from start/end of each run
    - Cleans up potentially unstable data at run boundaries
    - Maintains run detection but uses trimmed data for calculations
 
-4. **Power & Torque Calculation**: 
+4. **Power & Torque Calculation**:
    - Uses vehicle dynamics (F = ma) to calculate force required to accelerate the vehicle
    - Converts wheel force back to crankshaft torque using gear ratios
    - Applies estimates for rolling resistance, aerodynamic drag, and drivetrain efficiency
