@@ -16,6 +16,8 @@ ECUs log as a secondary or tertiary downstream function for diagnosis, they do n
 
 As such, the log at best is a blurry view of what the ECU was doing and cannot accurately show the time of an event, but rather a picture of the state of the engine in broad terms.
 
+## How a log can simulate a power run
+
 Using this broad data and with some load/wheel calculations, we can get an idea of the engine performance. The idea is that the logged ramp of RPM can be used to back-calculate the power generated - i.e. simply: for acceleration to continue at X rate with Y (load * wheel size * drive ratio * other parameters) it takes Z torque. Torque values are then converted to HP using standard formula.
 
 ### Mixed Frequency Logging
@@ -25,6 +27,7 @@ Some ECUs (the G4X, for instance) support mixed frequency onboard logging. One p
 ## Limitations
 
 - Inputs are only as good as outputs, setting up a dyno is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, etc. The more correct the inputs, the more potentially accurate become the outputs.
+- Log should be made on a flat road without interruption. Any incline will reduce the graphed power. Any descent will increase the graphed power.
 - Only works with G4X [the developer only has G4X ECUs] (but could be extended to others easily.)
 
 ## Features
@@ -125,80 +128,33 @@ The tool expects a CSV file with ECU log data containing these columns:
 - `IAT` - Intake air temperature
 - `Lambda 1` or `Lambda Avg` - Air/fuel ratio data
 
-## How It Works
+## Technical Implementation
 
-1. **Data Loading & Cleaning**:
-   - Loads CSV data and cleans column names
-   - Filters problematic RPM readings (duplicates, reversions)
-   - Applies configurable data smoothing
+The power calculation follows these fundamental physics relationships:
 
-2. **Power Run Detection**:
-   - Identifies periods where throttle position ≥ 99.5% and RPM is increasing steadily
-   - Bridges brief gaps (up to 3 consecutive invalid samples) to merge continuous runs
-   - Applies minimum duration and RPM range requirements
-
-3. **Frame Trimming**:
-   - Removes configurable number of frames (default 20) from start/end of each run
-   - Cleans up potentially unstable data at run boundaries
-   - Maintains run detection but uses trimmed data for calculations
-
-4. **Power & Torque Calculation**:
-   - Uses vehicle dynamics (F = ma) to calculate force required to accelerate the vehicle
-   - Converts wheel force back to crankshaft torque using gear ratios
-   - Applies estimates for rolling resistance, aerodynamic drag, and drivetrain efficiency
-   - Enforces HP-Torque relationship (HP = Torque × RPM ÷ 5252) for physical accuracy
-
-## Example Output
-
-The tool generates:
-- A text report with vehicle specifications and run summaries
-- Power and torque curves plotted vs RPM
-- Individual runs plus averaged curves if multiple runs are found
-- Dataset coverage visualization showing which parts of the log were used for analysis
-- Gap detection logging showing how data inconsistencies were handled
-
-### Sample Analysis Results
-
-**Honda EP3 Type R (Stock Setup):**
+**1. Vehicle Acceleration from RPM Data**
 ```
-Run 1: 4369-6242 RPM, Max 219.8 HP @ 6191 RPM, 162.3 lb-ft @ 4412 RPM
-Run 2: 6240-6775 RPM, Max 236.8 HP @ 6714 RPM, 166.7 lb-ft @ 6276 RPM
+wheel_rpm = engine_rpm / (final_drive × gear_ratio)
+vehicle_speed = wheel_rpm × tire_circumference × (π/30)
+acceleration = d(vehicle_speed)/dt
 ```
 
-*Note: Power differences reflect changes in wheel diameter, weight, and rolling resistance.*
+**2. Force Requirements**
+```
+Force_total = Force_acceleration + Force_rolling + Force_aero
+Force_acceleration = mass × acceleration
+Force_rolling = mass × g × rolling_resistance_coefficient
+Force_aero = 0.5 × air_density × drag_coefficient × frontal_area × speed²
+```
 
-## Limitations
+**3. Power and Torque Calculation**
+```
+Power_watts = Force_total × vehicle_speed
+Power_HP = Power_watts / 745.7
+Wheel_torque = Force_total × tire_radius
+Crank_torque = Wheel_torque / (final_drive × gear_ratio) / drivetrain_efficiency
+Torque_lbft = Crank_torque × 0.7376
+```
 
-- Power calculations are estimates based on vehicle dynamics
-- Requires accurate vehicle specifications for best results
-- Rolling resistance and aerodynamic drag are simplified estimates
-- Best accuracy when using actual wheel speed data vs calculated from RPM
-
-## Default Vehicle Specifications
-
-The tool defaults to Honda EP3 Type R specifications:
-- Weight: 998 kg + 91 kg occupant
-- Engine: 2.0L 4-cylinder
-- 4th gear ratio: 1.212:1
-- Final drive: 4.7:1
-- Tires: 195/50R15
-
-## Advanced Features
-
-### Gap Bridging
-The tool intelligently handles brief interruptions in power runs:
-- Allows up to 3 consecutive invalid samples before ending a run
-- Logs detected gaps and successful bridges
-- Prevents single data points from splitting continuous runs
-
-### Frame Trimming
-Configurable trimming of run start/end improves data quality:
-- Default: 20 frames trimmed from each end
-- Removes potentially unstable acceleration/deceleration phases
-- Coverage plot shows both detected runs (light) and trimmed data used (bold)
-
-### Data Filtering
-Advanced ECU data cleanup:
-- Removes duplicate RPM readings with different timestamps
-- Interpolates over RPM reversions during acceleration
-- Applies Gaussian smoothing with configurable intensity
+**4. Physical Validation**
+The fundamental relationship HP = (Torque × RPM) / 5252 must hold true, where the curves naturally cross at 5252 RPM when both are calculated correctly from the same physical principles.
