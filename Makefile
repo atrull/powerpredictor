@@ -25,12 +25,14 @@ k20-unfiltered:
 	MPLBACKEND=Agg uv run python power_predictor.py k20_pull2.csv --weight 1060 --occupant 130 --displacement 2.0 --no-rpm-filtering --out k20_pull2-unfiltered.png
 
 white:
-	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_nbg_run.png
-	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --gear-ratio 1.33 --displacement 1.6 --max-gap 10 --out white_pull2.png
+	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --final-drive 4.78 --displacement 1.6 --max-gap 10 --out white_nbg_run.png
+	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --gear-ratio 1.33 --final-drive 4.78 --displacement 1.6 --max-gap 10 --out white_pull2.png
+	MPLBACKEND=Agg uv run python power_predictor.py white_2_runs.csv --weight 1060 --occupant 130 --gear-ratio 1.0 --final-drive 4.78 --displacement 1.6 --max-gap 10 --out white_2_runs.png
 
 white-unfiltered:
-	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --displacement 1.6 --max-gap 10 --out white_nbg_run-unfiltered.png --no-rpm-filtering
-	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --gear-ratio 1.33 --displacement 1.6 --max-gap 10 --out white_pull2-unfiltered.png --no-rpm-filtering
+	MPLBACKEND=Agg uv run python power_predictor.py white_nbg_run.csv --weight 1060 --occupant 130 --final-drive 4.78 --displacement 1.6 --max-gap 10 --out white_nbg_run-unfiltered.png --no-rpm-filtering
+	MPLBACKEND=Agg uv run python power_predictor.py white_pull2.csv --weight 1060 --occupant 130 --gear-ratio 1.33 --final-drive 4.78 --displacement 1.6 --max-gap 10 --out white_pull2-unfiltered.png --no-rpm-filtering
+	MPLBACKEND=Agg uv run python power_predictor.py white_2_runs.csv --weight 1060 --occupant 130 --gear-ratio 1.0 --final-drive 4.78 --displacement 1.6 --max-gap 10 --out white_2_runs-unfiltered.png --no-rpm-filtering
 
 black:
 	# should be 4th gear 1.0 ratio but that predicts too much power
