@@ -2,13 +2,40 @@
 
 A tool for analyzing ECU log data to calculate power and torque curves, similar to a dynamometer. Inspired by Virtual Dyno [https://barnhill.bitbucket.io/] by Brad Barnhill [https://www.bradbarnhill.com/] but lacking all the testing, calibration and so on that that has (we hope) undergone.
 
+ECU Logs Supported:
+- G4X [the developer only has G4X ECUs]
+
+ECU Logs Planned [Raise a PR and submit a Log!]:
+- Haltech
+- Megasquirt
+- Hondata Kpro
+- ME221
+
 ## Overview
 
 This tool analyzes CSV logs from ECUs to determine power and torque by analyzing vehicle dynamics during wide-open-throttle (WOT) conditions. It uses acceleration data, vehicle weight, gearing, and tire specifications to calculate engine power and torque.
 
 It is best used for comparing runs between tunes of the same vehicle on the same day, or for getting a 'picture' without needing to hire a dyno.
 
-![alt text](k20.png "Screenshot")
+![alt text](k20.png "Single Run Screenshot")
+
+![alt text](white_2_runs.png "Two Run Screenshot")
+
+## General Process to generate Run CSVs
+
+**You must drive your car safely.**
+
+Steps:
+
+i. Warm your car up in the normal procedure, attach a laptop to your ECU (and start logging) or enable onboard logging.
+
+ii. Perform one or more runs from around 2000rpm to redline. **You must drive your car safely.** while performing these runs.
+
+**Tip:** For more accuracy/data, perform 2 runs in opposite directions of the same "flat, stragith, empty, safe" road. The more runs the better.
+
+iii. Save/export the log files and export as CSV files.
+
+iv. Collate your vehicle data/gear ratios and other factors together per the [Usage] section.
 
 ## How ECUs log
 
@@ -27,9 +54,8 @@ Some ECUs (the G4X, for instance) support mixed frequency onboard logging. One p
 ## Limitations
 
 - GIGO: Outputs are only as good as Inputs, setting up a dyno takes serious time, and is not the same as performing logged runs on a flat straight road in a safe environment, remembering which gear was used, precisely inputting all parameters. The more correct the inputs, the more potentially accurate become the outputs.
-- Log should be made on a flat road without interruption. Any incline will reduce the graphed power. Any descent will increase the graphed power.
-- Some ECUs only log a change in RPM every time they process a cylinder 1 ignition event, or the CAM or Crank angle sensor fires again. The hardware side of the ECU will process the firing just fine but the software side (logging) is a secondary concern. Some ECUs may even log reversions in RPM even though this is not physically possible during a power run.
-- Only works with G4X [the developer only has G4X ECUs] (but could be extended to others easily.)
+- Log should be made on a flat road without interruption. Any incline will reduce the graphed power. Any descent will increase the graphed power. Two runs on the same road in opposite directions may 'average out' gradient discrepancies.
+- Some ECUs only log a change in RPM every time they process a cylinder 1 ignition event, or the CAM or Crank angle sensor fires again. The hardware side of the ECU will process the firing just fine but the software side (logging) is a secondary concern. Some ECUs may even log reversions in RPM even though this is not physically possible during a power run. This software aims to clean up the log.
 
 ## Features
 
