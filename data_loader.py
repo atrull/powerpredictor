@@ -115,13 +115,13 @@ class DataLoader:
         # Determine optimal frequency based on current frequency and data quality
         if avg_freq > 200:  # High frequency like k20_pull.csv
             recommended_freq = 50  # Downsample significantly
-            print(f"High frequency data detected ({avg_freq:.1f}Hz) - recommending {recommended_freq}Hz for analysis")
+            print(f"Very High frequency data detected ({avg_freq:.1f}Hz) - recommending {recommended_freq}Hz for analysis")
         elif avg_freq > 100:
             recommended_freq = 25  # Moderate downsampling
-            print(f"Medium frequency data detected ({avg_freq:.1f}Hz) - recommending {recommended_freq}Hz for analysis")
-        elif avg_freq > 75:
-            recommended_freq = None  # Light downsampling or none
-            print(f"Good frequency data detected ({avg_freq:.1f}Hz) - no downsampling needed")
+            print(f"High frequency data detected ({avg_freq:.1f}Hz) - recommending {recommended_freq}Hz for analysis")
+        elif avg_freq > 50:
+            recommended_freq = 15  # Light downsampling
+            print(f"Raised frequency data detected ({avg_freq:.1f}Hz) - recommending {recommended_freq}Hz for analysis")
         else:
             recommended_freq = None  # No downsampling needed
             print(f"Standard frequency data detected ({avg_freq:.1f}Hz) - optimal for analysis")
