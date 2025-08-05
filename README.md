@@ -18,9 +18,9 @@ ECU Logs Planned [Raise a PR and submit a Log!]:
 
 **2) If given a choice, always choose safety over speed.**
 
-**3) If in doubt, consider going to a dyno, it will be safer.**
+**3) If in doubt, consider going to a dyno/rollers.**
 
-**4) The author(s) of this code have warned you as above. We deny any responsibility for any damaged caused.**
+**The author(s) of this code have warned you as above. We deny any responsibility for any damaged caused.**
 
 ## Overview
 
@@ -32,13 +32,16 @@ It is best used for comparing runs between tunes of the same vehicle on the same
 
 ![alt text](white_2_runs.png "Two Run Screenshot")
 
+![alt text](white_2_runs2.png "Two Run Screenshot from a different day/conditions")
+
+
 ## General Process to generate Run CSVs
 
 Steps:
 
 i. Warm your car up in the normal procedure, attach a laptop to your ECU (and start logging) or enable onboard logging.
 
-ii. Perform one or more runs from around 2000rpm to redline.
+ii. Perform one or more runs from around 2000rpm to redline or whatever safe rev limit you can achieve.
 
 **Tip:** For more accuracy/data, perform 2 runs in opposite directions of the same "flat, stragith, empty, safe" stretch of private track/airstrip/motorway. You can perform more runs...The more runs the better.
 
