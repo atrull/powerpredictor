@@ -10,6 +10,17 @@ ECU Logs Planned [Raise a PR and submit a Log!]:
 - Megasquirt
 - Hondata Kpro
 - ME221
+- [ Your ECU here if it supports CSV log output ].
+
+## General Safety Warning
+
+**1) You must drive your car safely and within the speed limits/driving conditions.**
+
+**2) If given a choice, always choose safety over speed.**
+
+**3) If in doubt, consider going to a dyno, it will be safer.**
+
+**4) The author(s) of this code have warned you as above. We deny any responsibility for any damaged caused.**
 
 ## Overview
 
@@ -23,17 +34,15 @@ It is best used for comparing runs between tunes of the same vehicle on the same
 
 ## General Process to generate Run CSVs
 
-**You must drive your car safely.**
-
 Steps:
 
 i. Warm your car up in the normal procedure, attach a laptop to your ECU (and start logging) or enable onboard logging.
 
-ii. Perform one or more runs from around 2000rpm to redline. **You must drive your car safely.** while performing these runs.
+ii. Perform one or more runs from around 2000rpm to redline.
 
-**Tip:** For more accuracy/data, perform 2 runs in opposite directions of the same "flat, stragith, empty, safe" road. The more runs the better.
+**Tip:** For more accuracy/data, perform 2 runs in opposite directions of the same "flat, stragith, empty, safe" stretch of private track/airstrip/motorway. You can perform more runs...The more runs the better.
 
-iii. Save/export the log files and export as CSV files.
+iii. Using a laptop or other device, Save/Export the log files as CSV files.
 
 iv. Collate your vehicle data/gear ratios and other factors together per the [Usage] section.
 
